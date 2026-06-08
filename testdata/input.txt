@@ -1,0 +1,4 @@
+Hello world hello MapReduce
+分布式 计算 框架 MapReduce
+Go 语言 实现 分布式 MapReduce
+hello Go 分布式

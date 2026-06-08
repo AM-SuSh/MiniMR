@@ -1,0 +1,5 @@
+{"url": "https://news.example.cn/article/1", "html": "<html><body><h1>人工智能</h1><p>深度学习是<strong>机器学习</strong>的分支。</p></body></html>", "timestamp": "2026-05-24T10:00:00Z"}
+{"url": "https://news.example.cn/article/2", "html": "<div>深度学习是机器学习的分支。</div>", "timestamp": "2026-05-24T10:01:00Z"}
+{"url": "https://blog.example.com/post/1", "html": "<p>MapReduce is a programming model.</p><script>ignore()</script>", "timestamp": "2026-05-24T11:00:00Z"}
+{"url": "https://blog.example.com/post/2", "html": "<article><h2>Go Language</h2><p>Go is great for concurrent programming.</p></article>", "timestamp": "2026-05-24T11:30:00Z"}
+{"url": "https://news.example.cn/article/3", "html": "<body><p>自然语言处理 与 计算机视觉 是 AI 两大方向。</p></body>", "timestamp": "2026-05-24T12:00:00Z"}

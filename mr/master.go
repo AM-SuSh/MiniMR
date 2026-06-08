@@ -1,0 +1,414 @@
+package mr
+
+import (
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"net/rpc"
+	"os"
+	"path/filepath"
+	"sync"
+	"time"
+)
+
+// Master coordinates job scheduling, RPC, and HTTP API.
+type Master struct {
+	mu       sync.Mutex
+	jobs     map[string]*Job //JobID-Job
+	current  *Job            //当前正在执行的作业（简化版只执行单作业，即同一时间Master只处理一个作业）
+	tm       *TaskManager    //任务管理器：跟踪任务分配、超时、重试
+	rpcAddr  string
+	httpAddr string
+	done     chan struct{} //关闭信号，用于停止服务。
+}
+
+// NewMaster creates a Master instance.
+func NewMaster(rpcAddr, httpAddr string) *Master {
+	return &Master{
+		jobs:     make(map[string]*Job),
+		rpcAddr:  rpcAddr,
+		httpAddr: httpAddr,
+		done:     make(chan struct{}),
+	}
+}
+
+func generateJobID() string {
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
+// StartJob creates and starts a new MapReduce job.
+func (m *Master) StartJob(config JobConfig) (*Job, error) {
+	if config.WorkDir == "" {
+		config.WorkDir = "mr-work"
+	}
+	if config.NReduce <= 0 {
+		config.NReduce = 3
+	}
+	if config.SplitSize <= 0 {
+		config.SplitSize = DefaultSplitSize
+	}
+
+	if err := os.MkdirAll(config.WorkDir, 0755); err != nil {
+		return nil, err
+	}
+
+	splits, err := SplitInput(config.InputFiles, config.SplitSize)
+	if err != nil {
+		return nil, err
+	}
+	if len(splits) == 0 {
+		return nil, fmt.Errorf("no input splits from files: %v", config.InputFiles)
+	}
+
+	config.NMap = len(splits)
+	jobID := generateJobID()
+	job := &Job{
+		ID:               jobID,
+		Config:           config,
+		State:            JobRunning,
+		CreatedAt:        time.Now(),
+		MapDoneForReduce: make([][]bool, config.NReduce),
+	}
+
+	for r := 0; r < config.NReduce; r++ {
+		job.MapDoneForReduce[r] = make([]bool, config.NMap)
+	}
+
+	for i, split := range splits {
+		job.MapTasks = append(job.MapTasks, &Task{
+			ID:      i,
+			Type:    MapTask,
+			State:   Idle,
+			MapInfo: &MapTaskInfo{Split: split},
+		})
+	}
+
+	for r := 0; r < config.NReduce; r++ {
+		job.ReduceTasks = append(job.ReduceTasks, &Task{
+			ID:       r,
+			Type:     ReduceTask,
+			State:    Idle,
+			ReduceID: r,
+		})
+	}
+
+	m.mu.Lock()
+	m.jobs[jobID] = job
+	m.current = job
+	m.tm = NewTaskManager(job)
+	m.mu.Unlock()
+
+	go m.tm.StartMonitor(m.done)
+	return job, nil
+}
+
+// RequestTask assigns the next available task to a Worker.
+func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.current == nil {
+		reply.TaskType = WaitTask
+		return nil
+	}
+
+	job := m.current
+	if m.tm != nil {
+		m.tm.RegisterWorker(args.WorkerID)
+	}
+
+	// Prefer map tasks.
+	for _, task := range job.MapTasks {
+		if task.State == Idle {
+			m.assignTaskLocked(job, task, args.WorkerID, reply)
+			return nil
+		}
+	}
+
+	// Reduce early scheduling: only assign reduce when all map outputs for that partition exist.
+	for _, task := range job.ReduceTasks {
+		if task.State == Idle && m.tm.IsReduceReady(task.ReduceID) {
+			m.assignTaskLocked(job, task, args.WorkerID, reply)
+			return nil
+		}
+	}
+
+	if m.allTasksCompleteLocked(job) {
+		reply.TaskType = ExitTask
+		job.State = JobCompleted
+		job.CompletedAt = time.Now()
+		return nil
+	}
+
+	reply.TaskType = WaitTask
+	return nil
+}
+
+func (m *Master) assignTaskLocked(job *Job, task *Task, workerID string, reply *RequestTaskReply) {
+	m.tm.AssignTask(task, workerID)
+	reply.TaskType = task.Type
+	reply.TaskID = task.ID
+	reply.NReduce = job.Config.NReduce
+	reply.NMap = job.Config.NMap
+	reply.MapFunc = job.Config.MapFunc
+	reply.ReduceFunc = job.Config.ReduceFunc
+	reply.CombineFunc = job.Config.CombineFunc
+	reply.WorkDir = job.Config.WorkDir
+	reply.JobID = job.ID
+	reply.ReduceID = task.ReduceID
+
+	if task.Type == MapTask && task.MapInfo != nil {
+		reply.InputFile = task.MapInfo.Split.File
+		reply.InputOffset = task.MapInfo.Split.Offset
+		reply.InputLength = task.MapInfo.Split.Length
+	}
+}
+
+func (m *Master) allTasksCompleteLocked(job *Job) bool {
+	for _, t := range job.MapTasks {
+		if t.State != Completed {
+			return false
+		}
+	}
+	for _, t := range job.ReduceTasks {
+		if t.State != Completed {
+			return false
+		}
+	}
+	return true
+}
+
+// ReportTask handles task completion reports from Workers.
+func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	reply.OK = true
+	if m.current == nil || m.current.ID != args.JobID {
+		return nil
+	}
+
+	job := m.current
+	var task *Task
+	if args.TaskType == MapTask {
+		if args.TaskID >= 0 && args.TaskID < len(job.MapTasks) {
+			task = job.MapTasks[args.TaskID]
+		}
+	} else if args.TaskType == ReduceTask {
+		if args.TaskID >= 0 && args.TaskID < len(job.ReduceTasks) {
+			task = job.ReduceTasks[args.TaskID]
+		}
+	}
+	if task == nil {
+		return nil
+	}
+
+	if args.Success {
+		m.tm.CompleteTask(task, true)
+		if args.TaskType == MapTask {
+			for r := 0; r < job.Config.NReduce; r++ {
+				m.tm.MarkMapDoneForReduce(args.TaskID, r)
+			}
+		}
+	} else {
+		m.tm.CompleteTask(task, false)
+	}
+
+	return nil
+}
+
+// Heartbeat updates worker liveness.
+func (m *Master) Heartbeat(args *HeartbeatArgs, reply *HeartbeatReply) error {
+	m.mu.Lock()
+	tm := m.tm
+	m.mu.Unlock()
+	if tm != nil {
+		tm.Heartbeat(args.WorkerID)
+	}
+	reply.Acknowledged = true
+	return nil
+}
+
+// Serve starts RPC and HTTP servers.
+func (m *Master) Serve() error {
+	rpc.Register(m)
+	rpc.HandleHTTP()
+
+	l, err := net.Listen("tcp", m.rpcAddr)
+	if err != nil {
+		return fmt.Errorf("rpc listen: %w", err)
+	}
+	log.Printf("Master RPC listening on %s", m.rpcAddr)
+
+	go func() {
+		for {
+			conn, err := l.Accept()
+			if err != nil {
+				select {
+				case <-m.done:
+					return
+				default:
+					log.Printf("rpc accept: %v", err)
+					continue
+				}
+			}
+			go rpc.ServeConn(conn)
+		}
+	}()
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/job", m.handleSubmitJob)
+	mux.HandleFunc("/api/status", m.handleStatus)
+	mux.HandleFunc("/api/result", m.handleResult)
+
+	log.Printf("Master HTTP listening on %s", m.httpAddr)
+	return http.ListenAndServe(m.httpAddr, mux)
+}
+
+func (m *Master) Shutdown() {
+	close(m.done)
+}
+
+type submitJobRequest struct {
+	InputFiles  []string `json:"input_files"`
+	NReduce     int      `json:"n_reduce"`
+	MapFunc     string   `json:"map_func"`
+	ReduceFunc  string   `json:"reduce_func"`
+	CombineFunc string   `json:"combine_func"`
+	SplitSize   int64    `json:"split_size"`
+	WorkDir     string   `json:"work_dir"`
+}
+
+type submitJobResponse struct {
+	JobID string `json:"job_id"`
+	State string `json:"state"`
+}
+
+func (m *Master) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req submitJobRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	job, err := m.StartJob(JobConfig{
+		InputFiles:  req.InputFiles,
+		NReduce:     req.NReduce,
+		MapFunc:     req.MapFunc,
+		ReduceFunc:  req.ReduceFunc,
+		CombineFunc: req.CombineFunc,
+		SplitSize:   req.SplitSize,
+		WorkDir:     req.WorkDir,
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(submitJobResponse{
+		JobID: job.ID,
+		State: job.State.String(),
+	})
+}
+
+func (m *Master) handleStatus(w http.ResponseWriter, r *http.Request) {
+	jobID := r.URL.Query().Get("job")
+	m.mu.Lock()
+	job, ok := m.jobs[jobID]
+	if !ok {
+		job = m.current
+	}
+	m.mu.Unlock()
+
+	if job == nil {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	m.mu.Lock()
+	mapDone, mapTotal := countCompleted(job.MapTasks)
+	reduceDone, reduceTotal := countCompleted(job.ReduceTasks)
+	state := job.State.String()
+	if m.allTasksCompleteLocked(job) {
+		job.State = JobCompleted
+		state = JobCompleted.String()
+	} else if mapDone < mapTotal || reduceDone < reduceTotal {
+		job.State = JobRunning
+		state = JobRunning.String()
+	}
+	m.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"job_id":           job.ID,
+		"state":            state,
+		"map_completed":    mapDone,
+		"map_total":        mapTotal,
+		"reduce_completed": reduceDone,
+		"reduce_total":     reduceTotal,
+	})
+}
+
+func countCompleted(tasks []*Task) (done, total int) {
+	total = len(tasks)
+	for _, t := range tasks {
+		if t.State == Completed {
+			done++
+		}
+	}
+	return
+}
+
+func (m *Master) handleResult(w http.ResponseWriter, r *http.Request) {
+	jobID := r.URL.Query().Get("job")
+	m.mu.Lock()
+	job, ok := m.jobs[jobID]
+	if !ok {
+		job = m.current
+	}
+	m.mu.Unlock()
+
+	if job == nil {
+		http.Error(w, "job not found", http.StatusNotFound)
+		return
+	}
+
+	var outputFiles []string
+	for rID := 0; rID < job.Config.NReduce; rID++ {
+		outputFiles = append(outputFiles, filepath.Join(job.Config.WorkDir, fmt.Sprintf("mr-out-%d", rID)))
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"job_id":       job.ID,
+		"state":        job.State.String(),
+		"output_files": outputFiles,
+		"work_dir":     job.Config.WorkDir,
+	})
+}
+
+// GetJob returns a job by ID (for testing).
+func (m *Master) GetJob(id string) *Job {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.jobs[id]
+}
+
+// GetCurrentJob returns the active job (for testing).
+func (m *Master) GetCurrentJob() *Job {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.current
+}
