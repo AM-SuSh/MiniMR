@@ -14,7 +14,21 @@ import (
 func main() {
 	masterAddr := flag.String("master", "localhost:8080", "Master RPC address")
 	workerID := flag.String("id", "", "Worker ID (auto-generated if empty)")
+	pluginName := flag.String("plugin-name", "", "Name prefix for plugin functions (e.g. 'wordcount')")
+	pluginPath := flag.String("plugin", "", "Path to .so plugin file (Linux only)")
 	flag.Parse()
+
+	if *pluginPath != "" {
+		name := *pluginName
+		if name == "" {
+			name = "plugin"
+		}
+		if err := mr.LoadPlugin(name, *pluginPath); err != nil {
+			log.Printf("Plugin load failed: %v, falling back to static UDF", err)
+		} else {
+			log.Printf("Plugin loaded: %s (prefix=%s)", *pluginPath, name)
+		}
+	}
 
 	id := *workerID
 	if id == "" {
