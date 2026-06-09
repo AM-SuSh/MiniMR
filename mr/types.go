@@ -85,14 +85,15 @@ func (s JobState) String() string {
 
 // JobConfig holds parameters for a MapReduce job.
 type JobConfig struct {
-	InputFiles  []string
-	NReduce     int
-	NMap        int
-	MapFunc     string
-	ReduceFunc  string
-	CombineFunc string
-	SplitSize   int64
-	WorkDir     string
+	InputFiles      []string
+	NReduce         int
+	NMap            int
+	MapFunc         string
+	ReduceFunc      string
+	CombineFunc     string
+	SplitSize       int64
+	WorkDir         string
+	ReduceSlowStart float64 // fraction of maps that must complete before reduce scheduling (0.0-1.0)
 }
 
 // Split describes one map input slice.
@@ -141,8 +142,12 @@ type Job struct {
 }
 
 const (
-	DefaultTaskTimeout   = 10 * time.Second
-	DefaultWorkerTimeout = 30 * time.Second
-	DefaultSplitSize     = 64 * 1024
-	DefaultHeartbeat     = 5 * time.Second
+	DefaultTaskTimeout        = 10 * time.Second
+	DefaultWorkerTimeout      = 30 * time.Second
+	DefaultSplitSize          = 64 * 1024
+	DefaultHeartbeat          = 5 * time.Second
+	DefaultReduceSlowStart    = 0.8
+	DefaultReduceTaskTimeout  = 120 * time.Second
+	ReduceShuffleTimeout      = 5 * time.Minute
+	ReduceShufflePollInterval = 500 * time.Millisecond
 )

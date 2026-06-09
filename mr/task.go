@@ -7,19 +7,25 @@ import (
 
 // TaskManager handles task state transitions, timeouts, and worker health.
 type TaskManager struct {
-	mu            sync.Mutex
-	job           *Job
-	workers       map[string]*WorkerInfo
-	taskTimeout   time.Duration
-	workerTimeout time.Duration
+	mu                sync.Mutex
+	job               *Job
+	workers           map[string]*WorkerInfo
+	taskTimeout       time.Duration
+	reduceTaskTimeout time.Duration
+	workerTimeout     time.Duration
 }
 
 func NewTaskManager(job *Job) *TaskManager {
+	reduceTimeout := DefaultTaskTimeout
+	if job.Config.ReduceSlowStart < 1.0 {
+		reduceTimeout = DefaultReduceTaskTimeout
+	}
 	return &TaskManager{
-		job:           job,
-		workers:       make(map[string]*WorkerInfo),
-		taskTimeout:   DefaultTaskTimeout,
-		workerTimeout: DefaultWorkerTimeout,
+		job:               job,
+		workers:           make(map[string]*WorkerInfo),
+		taskTimeout:       DefaultTaskTimeout,
+		reduceTaskTimeout: reduceTimeout,
+		workerTimeout:     DefaultWorkerTimeout,
 	}
 }
 
@@ -102,7 +108,11 @@ func (tm *TaskManager) checkTimeouts() {
 	allTasks := append(tm.job.MapTasks, tm.job.ReduceTasks...)
 	for _, task := range allTasks {
 		if task.State == InProgress && !task.StartTime.IsZero() {
-			if now.Sub(task.StartTime) > tm.taskTimeout {
+			timeout := tm.taskTimeout
+			if task.Type == ReduceTask {
+				timeout = tm.reduceTaskTimeout
+			}
+			if now.Sub(task.StartTime) > timeout {
 				task.State = Idle
 				task.WorkerID = ""
 				task.StartTime = time.Time{}
@@ -164,4 +174,31 @@ func (tm *TaskManager) IsReduceReady(reduceID int) bool {
 		}
 	}
 	return true
+}
+
+// CanScheduleReduce returns true when the global map completion ratio meets the
+// ReduceSlowStart threshold, allowing reduce tasks to begin their shuffle phase
+// before all maps finish.
+func (tm *TaskManager) CanScheduleReduce() bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+
+	totalMaps := len(tm.job.MapTasks)
+	if totalMaps == 0 {
+		return false
+	}
+
+	completedMaps := 0
+	for _, t := range tm.job.MapTasks {
+		if t.State == Completed {
+			completedMaps++
+		}
+	}
+
+	threshold := tm.job.Config.ReduceSlowStart
+	if threshold <= 0 || threshold > 1.0 {
+		threshold = 1.0
+	}
+
+	return float64(completedMaps)/float64(totalMaps) >= threshold
 }

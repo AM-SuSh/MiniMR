@@ -20,6 +20,7 @@ func main() {
 	combineFunc := flag.String("combine", "wordcount_combine", "Combine function name")
 	splitSize := flag.Int64("split", 0, "Split size in bytes (0 = default)")
 	workDir := flag.String("workdir", "mr-work", "Working directory")
+	slowStart := flag.Float64("slowstart", 0, "Reduce slow start threshold (0 = default 0.8)")
 	flag.Parse()
 
 	if *inputFiles == "" {
@@ -28,13 +29,14 @@ func main() {
 	//  将逗号分割的字符串转换为切片，方便底层循环处理
 	files := splitCSV(*inputFiles)
 	jobID, err := submitJob(*masterHTTP, map[string]interface{}{
-		"input_files":  files,
-		"n_reduce":     *nReduce,
-		"map_func":     *mapFunc,
-		"reduce_func":  *reduceFunc,
-		"combine_func": *combineFunc,
-		"split_size":   *splitSize,
-		"work_dir":     *workDir,
+		"input_files":       files,
+		"n_reduce":          *nReduce,
+		"map_func":          *mapFunc,
+		"reduce_func":       *reduceFunc,
+		"combine_func":      *combineFunc,
+		"split_size":        *splitSize,
+		"work_dir":          *workDir,
+		"reduce_slow_start": *slowStart,
 	})
 	if err != nil {
 		log.Fatal(err)

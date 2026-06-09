@@ -211,5 +211,38 @@ func TestReduceReadyScheduling(t *testing.T) {
 	}
 }
 
+func TestReduceSlowStartScheduling(t *testing.T) {
+	job := &mr.Job{
+		Config: mr.JobConfig{NMap: 5, NReduce: 2, ReduceSlowStart: 0.6},
+		MapTasks: []*mr.Task{
+			{ID: 0, Type: mr.MapTask, State: mr.Idle},
+			{ID: 1, Type: mr.MapTask, State: mr.Idle},
+			{ID: 2, Type: mr.MapTask, State: mr.Idle},
+			{ID: 3, Type: mr.MapTask, State: mr.Idle},
+			{ID: 4, Type: mr.MapTask, State: mr.Idle},
+		},
+		MapDoneForReduce: [][]bool{
+			{false, false, false, false, false},
+			{false, false, false, false, false},
+		},
+	}
+	tm := mr.NewTaskManager(job)
+
+	if tm.CanScheduleReduce() {
+		t.Fatal("reduce should not be schedulable with 0/5 maps done")
+	}
+
+	job.MapTasks[0].State = mr.Completed
+	job.MapTasks[1].State = mr.Completed
+	if tm.CanScheduleReduce() {
+		t.Fatal("reduce should not be schedulable with 2/5 (40%) maps done, threshold 60%")
+	}
+
+	job.MapTasks[2].State = mr.Completed
+	if !tm.CanScheduleReduce() {
+		t.Fatal("reduce should be schedulable with 3/5 (60%) maps done, threshold 60%")
+	}
+}
+
 // Ensure rpc types compile with net/rpc
 var _ = rpc.DefaultServer

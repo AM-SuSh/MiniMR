@@ -124,20 +124,42 @@ func (w *Worker) doReduce(reply RequestTaskReply) bool {
 		return false
 	}
 
+	// --- Shuffle phase: incrementally collect intermediate files ---
+	collected := make([]bool, reply.NMap)
 	var all []KeyValue
-	for m := 0; m < reply.NMap; m++ {
-		path := intermediatePath(reply.WorkDir, m, reply.ReduceID)
-		kvs, err := readJSONL(path)
-		if err != nil {
-			if os.IsNotExist(err) {
+	collectCount := 0
+	shuffleDeadline := time.Now().Add(ReduceShuffleTimeout)
+
+	for collectCount < reply.NMap {
+		for m := 0; m < reply.NMap; m++ {
+			if collected[m] {
 				continue
 			}
-			log.Printf("read intermediate %s: %v", path, err)
+			path := intermediatePath(reply.WorkDir, m, reply.ReduceID)
+			kvs, err := readJSONL(path)
+			if err != nil {
+				if os.IsNotExist(err) {
+					continue
+				}
+				log.Printf("read intermediate %s: %v", path, err)
+				return false
+			}
+			all = append(all, kvs...)
+			collected[m] = true
+			collectCount++
+		}
+
+		if collectCount >= reply.NMap {
+			break
+		}
+		if time.Now().After(shuffleDeadline) {
+			log.Printf("reduce %d: shuffle timed out (%d/%d files collected)", reply.ReduceID, collectCount, reply.NMap)
 			return false
 		}
-		all = append(all, kvs...)
+		time.Sleep(ReduceShufflePollInterval)
 	}
 
+	// --- Reduce phase ---
 	sort.Slice(all, func(i, j int) bool {
 		return all[i].Key < all[j].Key
 	})

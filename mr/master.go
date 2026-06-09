@@ -53,6 +53,9 @@ func (m *Master) StartJob(config JobConfig) (*Job, error) {
 	if config.SplitSize <= 0 {
 		config.SplitSize = DefaultSplitSize
 	}
+	if config.ReduceSlowStart <= 0 || config.ReduceSlowStart > 1.0 {
+		config.ReduceSlowStart = DefaultReduceSlowStart
+	}
 
 	if err := os.MkdirAll(config.WorkDir, 0755); err != nil {
 		return nil, err
@@ -131,11 +134,15 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 		}
 	}
 
-	// Reduce early scheduling: only assign reduce when all map outputs for that partition exist.
-	for _, task := range job.ReduceTasks {
-		if task.State == Idle && m.tm.IsReduceReady(task.ReduceID) {
-			m.assignTaskLocked(job, task, args.WorkerID, reply)
-			return nil
+	// Reduce slow start: schedule reduce when map completion ratio >= threshold,
+	// allowing the reduce worker to begin its shuffle phase (polling for
+	// intermediate files) while remaining maps are still running.
+	if m.tm.CanScheduleReduce() {
+		for _, task := range job.ReduceTasks {
+			if task.State == Idle {
+				m.assignTaskLocked(job, task, args.WorkerID, reply)
+				return nil
+			}
 		}
 	}
 
@@ -276,13 +283,14 @@ func (m *Master) Shutdown() {
 }
 
 type submitJobRequest struct {
-	InputFiles  []string `json:"input_files"`
-	NReduce     int      `json:"n_reduce"`
-	MapFunc     string   `json:"map_func"`
-	ReduceFunc  string   `json:"reduce_func"`
-	CombineFunc string   `json:"combine_func"`
-	SplitSize   int64    `json:"split_size"`
-	WorkDir     string   `json:"work_dir"`
+	InputFiles      []string `json:"input_files"`
+	NReduce         int      `json:"n_reduce"`
+	MapFunc         string   `json:"map_func"`
+	ReduceFunc      string   `json:"reduce_func"`
+	CombineFunc     string   `json:"combine_func"`
+	SplitSize       int64    `json:"split_size"`
+	WorkDir         string   `json:"work_dir"`
+	ReduceSlowStart float64  `json:"reduce_slow_start"`
 }
 
 type submitJobResponse struct {
@@ -303,13 +311,14 @@ func (m *Master) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	job, err := m.StartJob(JobConfig{
-		InputFiles:  req.InputFiles,
-		NReduce:     req.NReduce,
-		MapFunc:     req.MapFunc,
-		ReduceFunc:  req.ReduceFunc,
-		CombineFunc: req.CombineFunc,
-		SplitSize:   req.SplitSize,
-		WorkDir:     req.WorkDir,
+		InputFiles:      req.InputFiles,
+		NReduce:         req.NReduce,
+		MapFunc:         req.MapFunc,
+		ReduceFunc:      req.ReduceFunc,
+		CombineFunc:     req.CombineFunc,
+		SplitSize:       req.SplitSize,
+		WorkDir:         req.WorkDir,
+		ReduceSlowStart: req.ReduceSlowStart,
 	})
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
