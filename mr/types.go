@@ -110,13 +110,15 @@ type MapTaskInfo struct {
 
 // Task represents a schedulable unit of work.
 type Task struct {
-	ID        int
-	Type      TaskType
-	State     TaskState
-	WorkerID  string
-	StartTime time.Time
-	MapInfo   *MapTaskInfo
-	ReduceID  int
+	ID         int
+	Type       TaskType
+	State      TaskState
+	WorkerID   string
+	StartTime  time.Time
+	MapInfo    *MapTaskInfo
+	ReduceID   int
+	AttemptID  int // monotonically increasing; each (re)assignment bumps this
+	RetryCount int // incremented on hard timeout or explicit failure
 }
 
 // WorkerInfo tracks a registered worker.
@@ -125,6 +127,8 @@ type WorkerInfo struct {
 	LastHeartbeat time.Time
 	CurrentTask   int
 	CurrentType   TaskType
+	FailureCount  int  // consecutive task failures reported by this worker
+	Blacklisted   bool // true → worker receives ExitTask, no new assignments
 }
 
 // Job represents one submitted MapReduce job.
@@ -150,4 +154,9 @@ const (
 	DefaultReduceTaskTimeout  = 120 * time.Second
 	ReduceShuffleTimeout      = 5 * time.Minute
 	ReduceShufflePollInterval = 500 * time.Millisecond
+
+	DefaultMaxRetries        = 3   // per-task retry limit before job failure
+	DefaultMaxWorkerFailures = 3   // consecutive failures before worker blacklist
+	SpeculativeMinCompleted  = 3   // need N completed tasks before speculative checks
+	SpeculativeMultiplier    = 1.5 // task running > multiplier × median → speculative re-exec
 )

@@ -244,5 +244,127 @@ func TestReduceSlowStartScheduling(t *testing.T) {
 	}
 }
 
+func TestStaleAttemptRejection(t *testing.T) {
+	master := mr.NewMaster(":0", ":0")
+	workDir := t.TempDir()
+	job, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     workDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var reply mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "w1"}, &reply)
+	if reply.TaskType != mr.MapTask {
+		t.Fatalf("expected MapTask, got %v", reply.TaskType)
+	}
+	savedAttempt := reply.AttemptID
+
+	j := master.GetJob(job.ID)
+	task := j.MapTasks[reply.TaskID]
+	if task.AttemptID != savedAttempt {
+		t.Fatalf("attempt mismatch: task=%d reply=%d", task.AttemptID, savedAttempt)
+	}
+
+	task.State = mr.Idle
+	var reply2 mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "w2"}, &reply2)
+	if reply2.AttemptID == savedAttempt {
+		t.Fatal("expected bumped AttemptID after reassignment")
+	}
+
+	var rr mr.ReportTaskReply
+	master.ReportTask(&mr.ReportTaskArgs{
+		WorkerID:  "w1",
+		JobID:     job.ID,
+		TaskType:  mr.MapTask,
+		TaskID:    reply.TaskID,
+		AttemptID: savedAttempt,
+		Success:   true,
+	}, &rr)
+
+	if task.State == mr.Completed {
+		t.Fatal("stale report should not have completed the task")
+	}
+}
+
+func TestRetryLimitJobFailure(t *testing.T) {
+	job := &mr.Job{
+		Config: mr.JobConfig{NMap: 1, NReduce: 1},
+		MapTasks: []*mr.Task{
+			{ID: 0, Type: mr.MapTask, State: mr.InProgress,
+				StartTime: time.Now().Add(-20 * time.Second)},
+		},
+		ReduceTasks:      []*mr.Task{{ID: 0, Type: mr.ReduceTask, State: mr.Idle}},
+		MapDoneForReduce: [][]bool{{false}},
+	}
+
+	job.MapTasks[0].RetryCount = mr.DefaultMaxRetries
+
+	tm := mr.NewTaskManager(job)
+	done := make(chan struct{})
+	go tm.StartMonitor(done)
+	time.Sleep(1500 * time.Millisecond)
+	close(done)
+
+	if job.State != mr.JobFailed {
+		t.Fatalf("expected JobFailed, got %s", job.State)
+	}
+	if job.Error == "" {
+		t.Fatal("expected non-empty error reason")
+	}
+}
+
+func TestWorkerBlacklist(t *testing.T) {
+	master := mr.NewMaster(":0", ":0")
+	workDir := t.TempDir()
+	job, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		SplitSize:   10, // small splits → many map tasks so each failure uses a fresh task
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     workDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	badWorker := "bad-worker"
+	for i := 0; i < mr.DefaultMaxWorkerFailures; i++ {
+		var reply mr.RequestTaskReply
+		master.RequestTask(&mr.RequestTaskArgs{WorkerID: badWorker}, &reply)
+		if reply.TaskType == mr.ExitTask {
+			t.Logf("got ExitTask at iteration %d", i)
+			break
+		}
+		if reply.TaskType == mr.MapTask {
+			var rr mr.ReportTaskReply
+			master.ReportTask(&mr.ReportTaskArgs{
+				WorkerID:  badWorker,
+				JobID:     job.ID,
+				TaskType:  mr.MapTask,
+				TaskID:    reply.TaskID,
+				AttemptID: reply.AttemptID,
+				Success:   false,
+			}, &rr)
+		}
+	}
+
+	var reply mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: badWorker}, &reply)
+	if reply.TaskType != mr.ExitTask {
+		t.Fatalf("expected ExitTask for blacklisted worker, got %v", reply.TaskType)
+	}
+	_ = job
+}
+
 // Ensure rpc types compile with net/rpc
 var _ = rpc.DefaultServer

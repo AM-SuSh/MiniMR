@@ -20,15 +20,17 @@ type RequestTaskReply struct {
 	CombineFunc string
 	WorkDir     string
 	JobID       string
+	AttemptID   int // worker must echo this back in ReportTask
 }
 
 // ReportTaskArgs reports task completion or failure.
 type ReportTaskArgs struct {
-	WorkerID string
-	JobID    string
-	TaskType TaskType
-	TaskID   int
-	Success  bool
+	WorkerID  string
+	JobID     string
+	TaskType  TaskType
+	TaskID    int
+	AttemptID int // must match the current attempt; stale reports are ignored
+	Success   bool
 }
 
 // ReportTaskReply acknowledges a task report.

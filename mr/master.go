@@ -126,6 +126,17 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 		m.tm.RegisterWorker(args.WorkerID)
 	}
 
+	if job.State == JobFailed {
+		reply.TaskType = ExitTask
+		return nil
+	}
+
+	if m.tm.IsWorkerBlacklisted(args.WorkerID) {
+		log.Printf("worker %s is blacklisted, sending exit", args.WorkerID)
+		reply.TaskType = ExitTask
+		return nil
+	}
+
 	// Prefer map tasks.
 	for _, task := range job.MapTasks {
 		if task.State == Idle {
@@ -169,6 +180,7 @@ func (m *Master) assignTaskLocked(job *Job, task *Task, workerID string, reply *
 	reply.WorkDir = job.Config.WorkDir
 	reply.JobID = job.ID
 	reply.ReduceID = task.ReduceID
+	reply.AttemptID = task.AttemptID
 
 	if task.Type == MapTask && task.MapInfo != nil {
 		reply.InputFile = task.MapInfo.Split.File
@@ -216,15 +228,25 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 		return nil
 	}
 
+	if task.AttemptID != args.AttemptID {
+		log.Printf("stale report ignored: task %s-%d attempt %d (current %d) from worker %s",
+			args.TaskType, args.TaskID, args.AttemptID, task.AttemptID, args.WorkerID)
+		return nil
+	}
+
+	if task.State == Completed {
+		return nil
+	}
+
 	if args.Success {
-		m.tm.CompleteTask(task, true)
+		m.tm.CompleteTask(task, true, args.WorkerID)
 		if args.TaskType == MapTask {
 			for r := 0; r < job.Config.NReduce; r++ {
 				m.tm.MarkMapDoneForReduce(args.TaskID, r)
 			}
 		}
 	} else {
-		m.tm.CompleteTask(task, false)
+		m.tm.CompleteTask(task, false, args.WorkerID)
 	}
 
 	return nil

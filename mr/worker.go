@@ -43,10 +43,10 @@ func (w *Worker) Run() {
 		switch reply.TaskType {
 		case MapTask:
 			success := w.doMap(reply)
-			w.report(reply.JobID, MapTask, reply.TaskID, success)
+			w.report(reply.JobID, MapTask, reply.TaskID, reply.AttemptID, success)
 		case ReduceTask:
 			success := w.doReduce(reply)
-			w.report(reply.JobID, ReduceTask, reply.TaskID, success)
+			w.report(reply.JobID, ReduceTask, reply.TaskID, reply.AttemptID, success)
 		case WaitTask:
 			time.Sleep(time.Second)
 		case ExitTask:
@@ -67,14 +67,15 @@ func (w *Worker) heartbeatLoop() {
 	}
 }
 
-func (w *Worker) report(jobID string, taskType TaskType, taskID int, success bool) {
+func (w *Worker) report(jobID string, taskType TaskType, taskID int, attemptID int, success bool) {
 	var reply ReportTaskReply
 	_ = w.call("Master.ReportTask", &ReportTaskArgs{
-		WorkerID: w.ID,
-		JobID:    jobID,
-		TaskType: taskType,
-		TaskID:   taskID,
-		Success:  success,
+		WorkerID:  w.ID,
+		JobID:     jobID,
+		TaskType:  taskType,
+		TaskID:    taskID,
+		AttemptID: attemptID,
+		Success:   success,
 	}, &reply)
 }
 

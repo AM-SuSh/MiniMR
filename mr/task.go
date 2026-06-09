@@ -1,6 +1,9 @@
 package mr
 
 import (
+	"fmt"
+	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -13,6 +16,9 @@ type TaskManager struct {
 	taskTimeout       time.Duration
 	reduceTaskTimeout time.Duration
 	workerTimeout     time.Duration
+
+	completedMapTimes    []time.Duration
+	completedReduceTimes []time.Duration
 }
 
 func NewTaskManager(job *Job) *TaskManager {
@@ -29,9 +35,15 @@ func NewTaskManager(job *Job) *TaskManager {
 	}
 }
 
+// RegisterWorker creates or refreshes a worker entry.
+// An existing entry (including Blacklisted flag) is preserved.
 func (tm *TaskManager) RegisterWorker(id string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+	if w, ok := tm.workers[id]; ok {
+		w.LastHeartbeat = time.Now()
+		return
+	}
 	tm.workers[id] = &WorkerInfo{
 		ID:            id,
 		LastHeartbeat: time.Now(),
@@ -47,28 +59,50 @@ func (tm *TaskManager) Heartbeat(workerID string) {
 	}
 }
 
+// AssignTask transitions a task to InProgress and bumps its AttemptID.
 func (tm *TaskManager) AssignTask(task *Task, workerID string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	task.State = InProgress
 	task.WorkerID = workerID
 	task.StartTime = time.Now()
+	task.AttemptID++
 	if w, ok := tm.workers[workerID]; ok {
 		w.CurrentTask = task.ID
 		w.CurrentType = task.Type
 	}
 }
 
-func (tm *TaskManager) CompleteTask(task *Task, success bool) {
+// CompleteTask marks a task as Completed or Failed, tracks worker reliability,
+// and records completion time for speculative execution decisions.
+func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
+
+	if w, ok := tm.workers[workerID]; ok {
+		w.CurrentTask = -1
+		if success {
+			w.FailureCount = 0
+		} else {
+			w.FailureCount++
+			if w.FailureCount >= DefaultMaxWorkerFailures && !w.Blacklisted {
+				w.Blacklisted = true
+				log.Printf("worker %s blacklisted after %d consecutive failures", w.ID, w.FailureCount)
+				tm.resetWorkerTasksLocked(w.ID)
+			}
+		}
+	}
+
 	if success {
 		task.State = Completed
+		elapsed := time.Since(task.StartTime)
+		if task.Type == MapTask {
+			tm.completedMapTimes = append(tm.completedMapTimes, elapsed)
+		} else if task.Type == ReduceTask {
+			tm.completedReduceTimes = append(tm.completedReduceTimes, elapsed)
+		}
 	} else {
 		task.State = Failed
-	}
-	if w, ok := tm.workers[task.WorkerID]; ok {
-		w.CurrentTask = -1
 	}
 }
 
@@ -79,6 +113,20 @@ func (tm *TaskManager) ResetTask(task *Task) {
 	task.WorkerID = ""
 	task.StartTime = time.Time{}
 }
+
+// IsWorkerBlacklisted returns true if the worker has been flagged as unreliable.
+func (tm *TaskManager) IsWorkerBlacklisted(workerID string) bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if w, ok := tm.workers[workerID]; ok {
+		return w.Blacklisted
+	}
+	return false
+}
+
+// ---------------------------------------------------------------------------
+// Monitor loop — timeout / failure / speculative
+// ---------------------------------------------------------------------------
 
 // StartMonitor runs periodic timeout checks until the job completes.
 func (tm *TaskManager) StartMonitor(done <-chan struct{}) {
@@ -97,28 +145,116 @@ func (tm *TaskManager) StartMonitor(done <-chan struct{}) {
 func (tm *TaskManager) checkTimeouts() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-	now := time.Now()
 
-	for _, w := range tm.workers {
-		if now.Sub(w.LastHeartbeat) > tm.workerTimeout {
-			tm.resetWorkerTasksLocked(w.ID)
-		}
+	if tm.job.State == JobFailed {
+		return
 	}
 
-	allTasks := append(tm.job.MapTasks, tm.job.ReduceTasks...)
-	for _, task := range allTasks {
-		if task.State == InProgress && !task.StartTime.IsZero() {
-			timeout := tm.taskTimeout
-			if task.Type == ReduceTask {
-				timeout = tm.reduceTaskTimeout
+	now := time.Now()
+
+	var deadWorkers []string
+	for _, w := range tm.workers {
+		if !w.Blacklisted && now.Sub(w.LastHeartbeat) > tm.workerTimeout {
+			log.Printf("worker %s heartbeat timed out, resetting its tasks", w.ID)
+			tm.resetWorkerTasksLocked(w.ID)
+			deadWorkers = append(deadWorkers, w.ID)
+		}
+	}
+	for _, id := range deadWorkers {
+		delete(tm.workers, id)
+	}
+
+	mapMedian := medianDuration(tm.completedMapTimes)
+	reduceMedian := medianDuration(tm.completedReduceTimes)
+
+	for _, task := range tm.job.MapTasks {
+		tm.checkSingleTaskLocked(task, now, mapMedian, len(tm.completedMapTimes))
+	}
+	for _, task := range tm.job.ReduceTasks {
+		tm.checkSingleTaskLocked(task, now, reduceMedian, len(tm.completedReduceTimes))
+	}
+}
+
+func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median time.Duration, completedCount int) {
+	switch task.State {
+	case InProgress:
+		if task.StartTime.IsZero() {
+			return
+		}
+		timeout := tm.taskTimeout
+		if task.Type == ReduceTask {
+			timeout = tm.reduceTaskTimeout
+		}
+		elapsed := now.Sub(task.StartTime)
+
+		if elapsed > timeout {
+			task.RetryCount++
+			log.Printf("task %s-%d hard timeout (attempt %d, retry %d/%d)",
+				task.Type, task.ID, task.AttemptID, task.RetryCount, DefaultMaxRetries)
+			if task.RetryCount > DefaultMaxRetries {
+				tm.failJobLocked(fmt.Sprintf(
+					"task %s-%d exceeded max retries (%d)", task.Type, task.ID, DefaultMaxRetries))
+				return
 			}
-			if now.Sub(task.StartTime) > timeout {
+			task.State = Idle
+			task.WorkerID = ""
+			task.StartTime = time.Time{}
+			return
+		}
+
+		if completedCount >= SpeculativeMinCompleted && median > 0 {
+			threshold := time.Duration(float64(median) * SpeculativeMultiplier)
+			if elapsed > threshold {
+				log.Printf("speculative re-exec: task %s-%d running %v (median %v, threshold %v)",
+					task.Type, task.ID,
+					elapsed.Round(time.Millisecond),
+					median.Round(time.Millisecond),
+					threshold.Round(time.Millisecond))
 				task.State = Idle
 				task.WorkerID = ""
 				task.StartTime = time.Time{}
 			}
 		}
-		if task.State == Failed {
+
+	case Failed:
+		task.RetryCount++
+		log.Printf("task %s-%d failed (retry %d/%d)",
+			task.Type, task.ID, task.RetryCount, DefaultMaxRetries)
+		if task.RetryCount > DefaultMaxRetries {
+			tm.failJobLocked(fmt.Sprintf(
+				"task %s-%d exceeded max retries (%d)", task.Type, task.ID, DefaultMaxRetries))
+			return
+		}
+		task.State = Idle
+		task.WorkerID = ""
+		task.StartTime = time.Time{}
+	}
+}
+
+func (tm *TaskManager) failJobLocked(reason string) {
+	if tm.job.State == JobFailed {
+		return
+	}
+	tm.job.State = JobFailed
+	tm.job.Error = reason
+	tm.job.CompletedAt = time.Now()
+	log.Printf("JOB FAILED: %s", reason)
+}
+
+// resetWorkerTasksLocked resets all InProgress tasks belonging to the given
+// worker.  It does NOT remove the worker entry so that blacklist state survives.
+func (tm *TaskManager) resetWorkerTasksLocked(workerID string) {
+	for _, task := range tm.job.MapTasks {
+		if task.WorkerID == workerID && task.State == InProgress {
+			task.RetryCount++
+			task.State = Idle
+			task.WorkerID = ""
+			task.StartTime = time.Time{}
+		}
+	}
+	for _, task := range tm.job.ReduceTasks {
+		if task.WorkerID == workerID && task.State == InProgress {
+			task.RetryCount++
 			task.State = Idle
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
@@ -126,17 +262,9 @@ func (tm *TaskManager) checkTimeouts() {
 	}
 }
 
-func (tm *TaskManager) resetWorkerTasksLocked(workerID string) {
-	allTasks := append(tm.job.MapTasks, tm.job.ReduceTasks...)
-	for _, task := range allTasks {
-		if task.WorkerID == workerID && task.State == InProgress {
-			task.State = Idle
-			task.WorkerID = ""
-			task.StartTime = time.Time{}
-		}
-	}
-	delete(tm.workers, workerID)
-}
+// ---------------------------------------------------------------------------
+// Query helpers
+// ---------------------------------------------------------------------------
 
 func (tm *TaskManager) IsJobComplete() bool {
 	tm.mu.Lock()
@@ -201,4 +329,22 @@ func (tm *TaskManager) CanScheduleReduce() bool {
 	}
 
 	return float64(completedMaps)/float64(totalMaps) >= threshold
+}
+
+// ---------------------------------------------------------------------------
+// Utilities
+// ---------------------------------------------------------------------------
+
+func medianDuration(ds []time.Duration) time.Duration {
+	n := len(ds)
+	if n == 0 {
+		return 0
+	}
+	sorted := make([]time.Duration, n)
+	copy(sorted, ds)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
+	if n%2 == 0 {
+		return (sorted[n/2-1] + sorted[n/2]) / 2
+	}
+	return sorted[n/2]
 }
