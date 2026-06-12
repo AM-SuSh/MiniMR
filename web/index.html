@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>MiniMR · 调度控制台</title>
+  <script>
+    /* 提前应用主题，避免刷新时闪白/闪黑 */
+    try { document.documentElement.dataset.theme = localStorage.getItem("minimr-theme") || "dark"; } catch (e) {}
+  </script>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="top-nav">
+    <div class="nav-inner">
+      <div class="brand">
+        <div class="brand-mark">
+          <span class="mark-core">MR</span>
+        </div>
+        <div>
+          <p class="brand-eyebrow">JobTracker / TaskTracker</p>
+          <h1>MiniMR</h1>
+        </div>
+      </div>
+      <div class="conn-panel">
+        <div class="conn-field">
+          <label for="master-url">Master HTTP</label>
+          <input id="master-url" type="url" value="" placeholder="http://localhost:8081" autocomplete="off" />
+        </div>
+        <div class="conn-field conn-field--short">
+          <label for="job-id">Job ID</label>
+          <input id="job-id" type="text" placeholder="当前作业" autocomplete="off" />
+        </div>
+        <div class="conn-actions">
+          <button id="btn-connect" class="btn btn-primary" type="button">连接</button>
+          <button id="btn-pause" class="btn btn-ghost" type="button" aria-pressed="false">暂停</button>
+        </div>
+        <div class="live-indicator" id="live-indicator" title="轮询状态">
+          <span class="live-dot" id="live-dot"></span>
+          <span class="live-text" id="poll-status">未连接</span>
+        </div>
+        <button id="btn-theme" class="btn-icon" type="button" title="切换日间 / 夜间模式" aria-label="切换日间或夜间模式">
+          <svg class="icon-sun" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true">
+            <circle cx="12" cy="12" r="4.5"/>
+            <path d="M12 2v2.5M12 19.5V22M2 12h2.5M19.5 12H22M4.9 4.9l1.8 1.8M17.3 17.3l1.8 1.8M19.1 4.9l-1.8 1.8M6.7 17.3l-1.8 1.8"/>
+          </svg>
+          <svg class="icon-moon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" aria-hidden="true">
+            <path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.5 6.5 0 0 0 9.8 9.8z"/>
+          </svg>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <main class="page">
+    <section id="empty-state" class="empty-state">
+      <div class="empty-visual" aria-hidden="true">
+        <div class="pipeline pipeline--idle">
+          <div class="pipe-node"><span>Map</span></div>
+          <div class="pipe-line"></div>
+          <div class="pipe-node"><span>Shuffle</span></div>
+          <div class="pipe-line"></div>
+          <div class="pipe-node"><span>Reduce</span></div>
+        </div>
+      </div>
+      <p class="label">等待集群信号</p>
+      <h2>Master 尚未返回作业</h2>
+      <p class="empty-lead">先启动 Master，再连接此页。</p>
+      <pre class="hint-code"><span class="hint-prompt">$</span> go run ./cmd/master -port :8080 -http :8081</pre>
+    </section>
+
+    <div id="dashboard" class="dashboard hidden">
+      <div class="bento">
+        <!-- 流水线 -->
+        <section class="bento-hero card card--hero">
+          <div class="hero-inline">
+            <div class="hero-inline-text">
+              <p class="label">执行流水线</p>
+              <h2 class="hero-title" id="hero-job-label">作业运行中</h2>
+              <p class="hero-job-id" id="job-id-display"></p>
+            </div>
+            <span id="job-state" class="state-pill">—</span>
+          </div>
+          <div class="pipeline" id="pipeline" aria-label="MapReduce 阶段">
+            <div class="pipe-stage" data-stage="map">
+              <div class="pipe-node pipe-node--map">
+                <span class="pipe-label">Map</span>
+                <span class="pipe-value" id="pipe-map-pct">0%</span>
+              </div>
+              <div class="pipe-track"><div class="pipe-fill pipe-fill--map" id="pipe-map-bar"></div></div>
+            </div>
+            <div class="pipe-connector" id="pipe-shuffle-conn"><span class="flow-dot"></span><span class="flow-dot"></span><span class="flow-dot"></span></div>
+            <div class="pipe-stage" data-stage="shuffle">
+              <div class="pipe-node pipe-node--shuffle">
+                <span class="pipe-label">Shuffle</span>
+                <span class="pipe-value" id="pipe-shuffle-label">等待</span>
+              </div>
+            </div>
+            <div class="pipe-connector" id="pipe-reduce-conn"><span class="flow-dot"></span><span class="flow-dot"></span><span class="flow-dot"></span></div>
+            <div class="pipe-stage" data-stage="reduce">
+              <div class="pipe-node pipe-node--reduce">
+                <span class="pipe-label">Reduce</span>
+                <span class="pipe-value" id="pipe-reduce-pct">0%</span>
+              </div>
+              <div class="pipe-track"><div class="pipe-fill pipe-fill--reduce" id="pipe-reduce-bar"></div></div>
+            </div>
+          </div>
+          <div class="hero-stats">
+            <div class="stat-chip"><span class="stat-label">Map</span><span class="stat-value" id="map-progress-text">0 / 0</span></div>
+            <div class="stat-chip"><span class="stat-label">Reduce</span><span class="stat-value" id="reduce-progress-text">0 / 0</span></div>
+            <div class="stat-chip stat-chip--slowstart">
+              <span class="stat-label">Slow Start</span>
+              <span id="slowstart-status" class="slowstart-badge locked">未解锁</span>
+              <span id="slowstart-detail" class="stat-meta">—</span>
+            </div>
+          </div>
+        </section>
+
+        <!-- Map / Reduce -->
+        <section class="bento-map card">
+          <header class="card-header"><div><p class="label">分片计算</p><h2>Map 任务</h2></div></header>
+          <div id="map-tasks" class="task-grid"></div>
+        </section>
+        <section class="bento-reduce card">
+          <header class="card-header"><div><p class="label">聚合输出</p><h2>Reduce 任务</h2></div></header>
+          <div id="reduce-tasks" class="task-grid"></div>
+        </section>
+
+        <!-- Worker -->
+        <section class="bento-worker card">
+          <header class="card-header">
+            <div><p class="label">集群节点</p><h2>Worker 状态</h2></div>
+            <span class="count-badge" id="worker-count">0</span>
+          </header>
+          <div id="workers-grid" class="workers-grid"></div>
+          <p id="workers-empty" class="empty-inline hidden">还没有 Worker — 运行 <code>go run ./cmd/worker</code></p>
+        </section>
+
+        <!-- 决策日志（右侧实时流，macOS 终端风格） -->
+        <section class="bento-decisions terminal card--log" id="decisions-card">
+          <div class="terminal-bar">
+            <span class="tl-dot tl-red" aria-hidden="true"></span>
+            <span class="tl-dot tl-yellow" aria-hidden="true"></span>
+            <span class="tl-dot tl-green" aria-hidden="true"></span>
+            <span class="terminal-title">minimr — 调度决策日志</span>
+            <span class="terminal-count" id="decisions-count">0</span>
+          </div>
+          <div class="terminal-body">
+            <div class="terminal-cmd"><span class="terminal-prompt">$</span> tail -f scheduler.log</div>
+            <div id="decisions-log" class="decisions-log"></div>
+            <p id="decisions-empty" class="empty-inline terminal-waiting">等待调度事件<span class="cursor-blink">▋</span></p>
+          </div>
+        </section>
+
+        <!-- 分区 | 配置 -->
+        <section class="bento-partition card">
+          <header class="card-header"><div><p class="label">中间文件就绪</p><h2>Shuffle 分区</h2></div></header>
+          <div id="partition-grid" class="partition-grid"></div>
+        </section>
+        <aside class="bento-side">
+          <section class="card card--compact">
+            <header class="card-header"><div><p class="label">作业配置</p><h2>参数</h2></div></header>
+            <dl id="job-config" class="config-dl"></dl>
+          </section>
+          <section class="card card--compact">
+            <header class="card-header"><div><p class="label">推测执行</p><h2>调度参数</h2></div></header>
+            <dl id="scheduling-insight" class="config-dl"></dl>
+          </section>
+        </aside>
+      </div>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <span id="last-update">—</span>
+    <span class="footer-sep">·</span>
+    <span>MiniMR Dashboard</span>
+  </footer>
+
+  <script src="app.js"></script>
+</body>
+</html>

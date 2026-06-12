@@ -292,11 +292,13 @@ func (m *Master) Serve() error {
 	}()
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/job", m.handleSubmitJob)
-	mux.HandleFunc("/api/status", m.handleStatus)
-	mux.HandleFunc("/api/result", m.handleResult)
+	mux.HandleFunc("/api/job", m.withCORS(m.handleSubmitJob))
+	mux.HandleFunc("/api/status", m.withCORS(m.handleStatus))
+	mux.HandleFunc("/api/result", m.withCORS(m.handleResult))
+	mux.HandleFunc("/api/dashboard", m.withCORS(m.handleDashboard))
+	mux.Handle("/", http.FileServer(http.Dir("web")))
 
-	log.Printf("Master HTTP listening on %s", m.httpAddr)
+	log.Printf("Master HTTP listening on %s (dashboard: http://localhost%s/)", m.httpAddr, m.httpAddr)
 	return http.ListenAndServe(m.httpAddr, mux)
 }
 
@@ -352,6 +354,44 @@ func (m *Master) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		JobID: job.ID,
 		State: job.State.String(),
 	})
+}
+
+func (m *Master) withCORS(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (m *Master) handleDashboard(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	jobID := r.URL.Query().Get("job")
+	m.mu.Lock()
+	job, ok := m.jobs[jobID]
+	if !ok {
+		job = m.current
+	}
+	m.mu.Unlock()
+
+	if job == nil {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(DashboardSnapshot{ServerTime: time.Now()})
+		return
+	}
+
+	snap := m.BuildDashboardSnapshot(job)
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(snap)
 }
 
 func (m *Master) handleStatus(w http.ResponseWriter, r *http.Request) {

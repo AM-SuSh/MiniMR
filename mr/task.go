@@ -19,6 +19,8 @@ type TaskManager struct {
 
 	completedMapTimes    []time.Duration
 	completedReduceTimes []time.Duration
+	decisions            []DecisionEvent
+	reduceSlowStartLogged bool
 }
 
 func NewTaskManager(job *Job) *TaskManager {
@@ -71,6 +73,14 @@ func (tm *TaskManager) AssignTask(task *Task, workerID string) {
 		w.CurrentTask = task.ID
 		w.CurrentType = task.Type
 	}
+	tm.logDecision(DecisionEvent{
+		Type:      DecisionAssign,
+		Message:   fmt.Sprintf("分配 %s-%d → %s (attempt %d)", task.Type, task.ID, workerID, task.AttemptID),
+		WorkerID:  workerID,
+		TaskType:  task.Type.String(),
+		TaskID:    task.ID,
+		AttemptID: task.AttemptID,
+	})
 }
 
 // CompleteTask marks a task as Completed or Failed, tracks worker reliability,
@@ -88,6 +98,11 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string) {
 			if w.FailureCount >= DefaultMaxWorkerFailures && !w.Blacklisted {
 				w.Blacklisted = true
 				log.Printf("worker %s blacklisted after %d consecutive failures", w.ID, w.FailureCount)
+				tm.logDecision(DecisionEvent{
+					Type:     DecisionBlacklist,
+					Message:  fmt.Sprintf("Worker %s 连续失败 %d 次，已拉黑", w.ID, w.FailureCount),
+					WorkerID: w.ID,
+				})
 				tm.resetWorkerTasksLocked(w.ID)
 			}
 		}
@@ -101,8 +116,24 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string) {
 		} else if task.Type == ReduceTask {
 			tm.completedReduceTimes = append(tm.completedReduceTimes, elapsed)
 		}
+		tm.logDecision(DecisionEvent{
+			Type:      DecisionComplete,
+			Message:   fmt.Sprintf("%s-%d 完成 (耗时 %v, worker %s)", task.Type, task.ID, elapsed.Round(time.Millisecond), workerID),
+			WorkerID:  workerID,
+			TaskType:  task.Type.String(),
+			TaskID:    task.ID,
+			AttemptID: task.AttemptID,
+		})
 	} else {
 		task.State = Failed
+		tm.logDecision(DecisionEvent{
+			Type:      DecisionFail,
+			Message:   fmt.Sprintf("%s-%d 失败 (worker %s, attempt %d)", task.Type, task.ID, workerID, task.AttemptID),
+			WorkerID:  workerID,
+			TaskType:  task.Type.String(),
+			TaskID:    task.ID,
+			AttemptID: task.AttemptID,
+		})
 	}
 }
 
@@ -161,8 +192,15 @@ func (tm *TaskManager) checkTimeouts() {
 		}
 	}
 	for _, id := range deadWorkers {
+		tm.logDecision(DecisionEvent{
+			Type:     DecisionWorkerTimeout,
+			Message:  fmt.Sprintf("Worker %s 心跳超时，重置其进行中任务", id),
+			WorkerID: id,
+		})
 		delete(tm.workers, id)
 	}
+
+	tm.maybeLogReduceSlowStartLocked()
 
 	mapMedian := medianDuration(tm.completedMapTimes)
 	reduceMedian := medianDuration(tm.completedReduceTimes)
@@ -191,6 +229,14 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 			task.RetryCount++
 			log.Printf("task %s-%d hard timeout (attempt %d, retry %d/%d)",
 				task.Type, task.ID, task.AttemptID, task.RetryCount, DefaultMaxRetries)
+			tm.logDecision(DecisionEvent{
+				Type:      DecisionTimeout,
+				Message:   fmt.Sprintf("%s-%d 硬超时 (%v > %v)，重试 %d/%d", task.Type, task.ID, elapsed.Round(time.Millisecond), timeout, task.RetryCount, DefaultMaxRetries),
+				WorkerID:  task.WorkerID,
+				TaskType:  task.Type.String(),
+				TaskID:    task.ID,
+				AttemptID: task.AttemptID,
+			})
 			if task.RetryCount > DefaultMaxRetries {
 				tm.failJobLocked(fmt.Sprintf(
 					"task %s-%d exceeded max retries (%d)", task.Type, task.ID, DefaultMaxRetries))
@@ -210,6 +256,14 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 					elapsed.Round(time.Millisecond),
 					median.Round(time.Millisecond),
 					threshold.Round(time.Millisecond))
+				tm.logDecision(DecisionEvent{
+					Type:      DecisionSpeculative,
+					Message:   fmt.Sprintf("推测执行：%s-%d 运行 %v 超过阈值 %v (中位数 %v × %.1f)", task.Type, task.ID, elapsed.Round(time.Millisecond), threshold.Round(time.Millisecond), median.Round(time.Millisecond), SpeculativeMultiplier),
+					WorkerID:  task.WorkerID,
+					TaskType:  task.Type.String(),
+					TaskID:    task.ID,
+					AttemptID: task.AttemptID,
+				})
 				task.State = Idle
 				task.WorkerID = ""
 				task.StartTime = time.Time{}
@@ -239,6 +293,41 @@ func (tm *TaskManager) failJobLocked(reason string) {
 	tm.job.Error = reason
 	tm.job.CompletedAt = time.Now()
 	log.Printf("JOB FAILED: %s", reason)
+	tm.logDecision(DecisionEvent{
+		Type:    DecisionJobFailed,
+		Message: reason,
+	})
+}
+
+func (tm *TaskManager) maybeLogReduceSlowStartLocked() {
+	if tm.reduceSlowStartLogged {
+		return
+	}
+	totalMaps := len(tm.job.MapTasks)
+	if totalMaps == 0 {
+		return
+	}
+	completedMaps := 0
+	for _, t := range tm.job.MapTasks {
+		if t.State == Completed {
+			completedMaps++
+		}
+	}
+	threshold := tm.job.Config.ReduceSlowStart
+	if threshold <= 0 || threshold > 1.0 {
+		threshold = 1.0
+	}
+	ratio := float64(completedMaps) / float64(totalMaps)
+	if ratio >= threshold {
+		tm.reduceSlowStartLogged = true
+		tm.logDecision(DecisionEvent{
+			Type: DecisionReduceSlowStart,
+			Message: fmt.Sprintf(
+				"Reduce Slow Start 解锁：Map 完成率 %.0f%% ≥ 阈值 %.0f%%，可调度 Reduce Shuffle",
+				ratio*100, threshold*100,
+			),
+		})
+	}
 }
 
 // resetWorkerTasksLocked resets all InProgress tasks belonging to the given
@@ -310,25 +399,7 @@ func (tm *TaskManager) IsReduceReady(reduceID int) bool {
 func (tm *TaskManager) CanScheduleReduce() bool {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
-
-	totalMaps := len(tm.job.MapTasks)
-	if totalMaps == 0 {
-		return false
-	}
-
-	completedMaps := 0
-	for _, t := range tm.job.MapTasks {
-		if t.State == Completed {
-			completedMaps++
-		}
-	}
-
-	threshold := tm.job.Config.ReduceSlowStart
-	if threshold <= 0 || threshold > 1.0 {
-		threshold = 1.0
-	}
-
-	return float64(completedMaps)/float64(totalMaps) >= threshold
+	return tm.canScheduleReduceLocked()
 }
 
 // ---------------------------------------------------------------------------
