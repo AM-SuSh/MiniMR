@@ -13,14 +13,16 @@ import (
 func main() {
 	input := flag.String("input", "testdata/input.txt", "Input file")
 	output := flag.String("output", "mr-out-standalone", "Output file prefix")
+	nMap := flag.Int("nmap", 0, "Number of map tasks (0 = auto from split size)")
 	nReduce := flag.Int("nreduce", 3, "Number of reduce partitions")
 	udfName := flag.String("udf", "wordcount", "UDF set: wordcount or crawl_clean")
-	splitSize := flag.Int64("split", 0, "Split size in bytes (0 = default 32 MiB)")
+	splitSize := flag.Int64("split", 0, "Map split size in bytes (0 = default 32 MiB, ignored when -nmap > 0)")
 	flag.Parse()
 
 	mapFn, reduceFn, combineFn := resolveUDF(*udfName)
 	job, err := mr.RunLocal(mr.JobConfig{
 		InputFiles:  []string{*input},
+		NMap:        *nMap,
 		NReduce:     *nReduce,
 		MapFunc:     mapFn,
 		ReduceFunc:  reduceFn,

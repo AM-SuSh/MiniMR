@@ -19,14 +19,14 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 	if config.NReduce <= 0 {
 		config.NReduce = 3
 	}
-	if config.SplitSize <= 0 {
+	if config.NMap <= 0 && config.SplitSize <= 0 {
 		config.SplitSize = DefaultSplitSize
 	}
 	if config.ReduceSlowStart <= 0 || config.ReduceSlowStart > 1.0 {
 		config.ReduceSlowStart = DefaultReduceSlowStart
 	}
 
-	splits, err := SplitInput(config.InputFiles, config.SplitSize)
+	splits, err := PrepareSplits(config.InputFiles, config.SplitSize, config.NMap)
 	if err != nil {
 		return nil, err
 	}

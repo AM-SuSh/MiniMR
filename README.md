@@ -115,17 +115,48 @@ GOOS=linux go build -buildmode=plugin -o wordcount_reducer.so udf/plugins/wordco
 go test ./... -v -count=1
 ```
 
+## 测试
+
+```bash
+# Master
+go run ./cmd/master -port :8080 -http :8081
+
+# Worker
+go run ./cmd/worker -master localhost:8080 -id worker-1
+
+# Client
+go run ./cmd/client `
+  -master-http http://localhost:8081 `
+  -input testdata/pd.train.part1 `
+  -nmap 4`
+  -nreduce 3 `
+  -map wordcount_map `
+  -reduce wordcount_reduce `
+  -combine wordcount_combine `
+  -workdir mr-work-pd `
+  -split 67108864 `
+  -slowstart 0.6
+```
+
+
+
 ## 优化特性
 
 - **Reduce 提前调度**：某 reduce 分区所有 Map 输出就绪即可开始 Reduce
 - **Combine**：Map 端本地预聚合，减少 Shuffle 数据量
 - **Shuffle 优化**：
-      - 二进制编码
-      - gzip压缩
-      ```
-      go run ./cmd/shuffle_bench -nreduce 5
-      ```
-      - Map 端按 key 排序写入，Reduce 端归并
+  
+  - 二进制编码
+  
+  - gzip压缩
+  
+       ```
+       go run ./cmd/shuffle_bench -nreduce 5
+       ```
+  
+  - Map 端按 key 排序写入，Reduce 端归并
+  
+  - gzip压缩
 - **容错**：任务超时重分配、Worker 心跳检测、中间文件原子写入
 
 ## 环境要求

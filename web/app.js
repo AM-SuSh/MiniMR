@@ -644,7 +644,7 @@
       ["Map 函数", cfg.map_func || "—"],
       ["Reduce", cfg.reduce_func || "—"],
       ["Combine", cfg.combine_func || "—"],
-      ["分片", cfg.split_size ? formatBytes(cfg.split_size) : "32 MB"],
+      ["分片大小", cfg.split_size ? formatBytes(cfg.split_size) : "32 MB（默认）"],
       ["目录", cfg.work_dir],
       ["Slow Start", cfg.reduce_slow_start],
     ]);

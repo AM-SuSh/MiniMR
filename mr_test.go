@@ -44,6 +44,50 @@ func TestSplitInput(t *testing.T) {
 	}
 }
 
+func TestSplitInputByCount(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "input.txt")
+	content := strings.Repeat("hello world\n", 100)
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, nMap := range []int{1, 3, 5, 10} {
+		splits, err := mr.SplitInputByCount([]string{path}, nMap)
+		if err != nil {
+			t.Fatalf("nMap=%d: %v", nMap, err)
+		}
+		if len(splits) != nMap {
+			t.Fatalf("nMap=%d: expected %d splits, got %d", nMap, nMap, len(splits))
+		}
+		var total int64
+		for _, s := range splits {
+			total += s.Length
+		}
+		info, _ := os.Stat(path)
+		if total != info.Size() {
+			t.Fatalf("nMap=%d: split total %d != file size %d", nMap, total, info.Size())
+		}
+	}
+}
+
+func TestPrepareSplitsPrefersNMap(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "input.txt")
+	content := strings.Repeat("hello world\n", 100)
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	splits, err := mr.PrepareSplits([]string{path}, 200, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(splits) != 4 {
+		t.Fatalf("expected 4 splits, got %d", len(splits))
+	}
+}
+
 func TestWordCountUDF(t *testing.T) {
 	input := "hello world hello Go 分布式"
 	kvs := udf.WordCountMap("test", input)
