@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"fmt"
 	"mapreduce/mr"
 	"net/url"
 	"regexp"
@@ -98,9 +97,4 @@ func cleanHTML(html string) string {
 		}
 	}
 	return strings.TrimSpace(b.String())
-}
-
-// FormatCrawlResult is a helper for display.
-func FormatCrawlResult(domain, jsonStr string) string {
-	return fmt.Sprintf("%s: %s", domain, jsonStr)
 }

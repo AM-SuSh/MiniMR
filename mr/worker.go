@@ -13,6 +13,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,23 +23,31 @@ import (
 type Worker struct {
 	ID         string
 	MasterAddr string
+	done       chan struct{}
+	stopOnce   sync.Once
 }
 
 // NewWorker creates a Worker with the given ID and master address.
 func NewWorker(id, masterAddr string) *Worker {
-	return &Worker{ID: id, MasterAddr: masterAddr}
+	return &Worker{ID: id, MasterAddr: masterAddr, done: make(chan struct{})}
 }
 
 // Run starts the worker loop until ExitTask is received.
 func (w *Worker) Run() {
+	if w.done == nil {
+		w.done = make(chan struct{})
+	}
 	go w.heartbeatLoop()
+	defer w.stop()
 
 	for {
 		var reply RequestTaskReply
 		err := w.call("Master.RequestTask", &RequestTaskArgs{WorkerID: w.ID}, &reply)
 		if err != nil {
 			log.Printf("RequestTask failed: %v, retrying...", err)
-			time.Sleep(time.Second)
+			if !w.sleepOrDone(time.Second) {
+				return
+			}
 			continue
 		}
 
@@ -59,7 +70,9 @@ func (w *Worker) Run() {
 			if reply.JobState == JobFailed.String() {
 				log.Printf("Worker %s: job %s failed, idle until next job", w.ID, reply.JobID)
 			}
-			time.Sleep(time.Second)
+			if !w.sleepOrDone(time.Second) {
+				return
+			}
 		case ExitTask:
 			log.Printf("Worker %s received exit signal", w.ID)
 			return
@@ -69,12 +82,39 @@ func (w *Worker) Run() {
 
 func (w *Worker) heartbeatLoop() {
 	for {
+		select {
+		case <-w.done:
+			return
+		default:
+		}
 		var reply HeartbeatReply
 		err := w.call("Master.Heartbeat", &HeartbeatArgs{WorkerID: w.ID}, &reply)
 		if err != nil {
 			log.Printf("Heartbeat failed: %v", err)
 		}
-		time.Sleep(DefaultHeartbeat)
+		if !w.sleepOrDone(DefaultHeartbeat) {
+			return
+		}
+	}
+}
+
+func (w *Worker) stop() {
+	w.stopOnce.Do(func() {
+		if w.done == nil {
+			return
+		}
+		close(w.done)
+	})
+}
+
+func (w *Worker) sleepOrDone(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-w.done:
+		return false
+	case <-timer.C:
+		return true
 	}
 }
 
@@ -133,7 +173,7 @@ func (w *Worker) doMap(reply RequestTaskReply) (bool, TaskMetrics, string) {
 			return partitions[r][i].Key < partitions[r][j].Key
 		})
 		outPath := intermediatePath(reply.WorkDir, reply.TaskID, r)
-		fileMetrics, err := atomicWriteBinaryWithStats(outPath, partitions[r], reply.JobID)
+		fileMetrics, err := atomicWriteBinaryWithStats(outPath, partitions[r], reply.JobID, reply.AttemptID)
 		if err != nil {
 			reason := fmt.Sprintf("intermediate_write: %v", err)
 			log.Printf("write intermediate %s: %v", outPath, err)
@@ -191,7 +231,18 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics, string) {
 	// Phase 2  Open K sorted streams and seed the min-heap.
 	readers := make([]*kvStreamReader, reply.NMap)
 	for m := 0; m < reply.NMap; m++ {
-		path := intermediatePath(reply.WorkDir, m, reply.ReduceID)
+		basePath := intermediatePath(reply.WorkDir, m, reply.ReduceID)
+		path, ok := committedIntermediatePath(basePath, reply.JobID)
+		if !ok {
+			reason := fmt.Sprintf("intermediate_read: committed intermediate missing for map %d reduce %d", m, reply.ReduceID)
+			log.Printf("%s", reason)
+			for _, rr := range readers {
+				if rr != nil {
+					rr.Close()
+				}
+			}
+			return false, metrics, reason
+		}
 		r, err := openKVStream(path)
 		if err != nil {
 			reason := fmt.Sprintf("intermediate_read: %v", err)
@@ -217,24 +268,40 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics, string) {
 	mh := &mergeHeap{}
 	heap.Init(mh)
 	for i, r := range readers {
-		if kv, ok := r.Next(); ok {
+		kv, ok, err := r.Next()
+		if err != nil {
+			return false, metrics, fmt.Sprintf("intermediate_read: %v", err)
+		}
+		if ok {
 			heap.Push(mh, mergeItem{kv: kv, streamID: i})
 		}
 	}
 
 	// Phase 3  Streaming merge-reduce: pop from heap, group by key, reduce.
-	outPath := filepath.Join(reply.WorkDir, fmt.Sprintf("mr-out-%d", reply.ReduceID))
+	outPath := reduceAttemptPath(reply.WorkDir, reply.ReduceID, reply.AttemptID)
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 		reason := fmt.Sprintf("output_write: mkdir %v", err)
 		log.Printf("mkdir: %v", err)
 		return false, metrics, reason
 	}
-	f, err := os.Create(outPath)
+	tmp, err := tempPathFor(outPath)
 	if err != nil {
-		reason := fmt.Sprintf("output_write: create %v", err)
-		log.Printf("create %s: %v", outPath, err)
+		reason := fmt.Sprintf("output_write: temp %v", err)
+		log.Printf("temp path %s: %v", outPath, err)
 		return false, metrics, reason
 	}
+	f, err := os.Create(tmp)
+	if err != nil {
+		reason := fmt.Sprintf("output_write: create %v", err)
+		log.Printf("create %s: %v", tmp, err)
+		return false, metrics, reason
+	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmp)
+		}
+	}()
 	bw := bufio.NewWriterSize(f, 64*1024)
 
 	var curKey string
@@ -259,8 +326,12 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics, string) {
 		if int64(len(curVals)) > metrics.ReduceMaxBufferedValues {
 			metrics.ReduceMaxBufferedValues = int64(len(curVals))
 		}
-		// 从同源流补一条回堆 —— 补
-		if kv, ok := readers[item.streamID].Next(); ok {
+		kv, ok, err := readers[item.streamID].Next()
+		if err != nil {
+			f.Close()
+			return false, metrics, fmt.Sprintf("intermediate_read: %v", err)
+		}
+		if ok {
 			heap.Push(mh, mergeItem{kv: kv, streamID: item.streamID})
 		}
 	}
@@ -278,6 +349,10 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics, string) {
 	if err := f.Close(); err != nil {
 		return false, metrics, fmt.Sprintf("output_write: close %v", err)
 	}
+	if err := atomicReplaceFile(tmp, outPath); err != nil {
+		return false, metrics, fmt.Sprintf("output_write: publish attempt %v", err)
+	}
+	cleanupTmp = false
 	metrics.ReduceWriteMs = time.Since(writeStart).Milliseconds()
 	return true, metrics, ""
 }
@@ -350,28 +425,31 @@ func openKVStream(path string) (*kvStreamReader, error) {
 	}, nil
 }
 
-// Next returns the next KV pair. ok is false when the stream is exhausted.
-func (r *kvStreamReader) Next() (KeyValue, bool) {
+// Next returns the next KV pair. ok is false only when the stream is cleanly exhausted.
+func (r *kvStreamReader) Next() (KeyValue, bool, error) {
 	if r.br == nil {
-		return KeyValue{}, false
+		return KeyValue{}, false, nil
 	}
 	if _, err := io.ReadFull(r.br, r.hdr[:]); err != nil {
-		return KeyValue{}, false
+		if err == io.EOF {
+			return KeyValue{}, false, nil
+		}
+		return KeyValue{}, false, fmt.Errorf("read key length: %w", err)
 	}
 	keyLen := binary.BigEndian.Uint32(r.hdr[:])
 	key := make([]byte, keyLen)
 	if _, err := io.ReadFull(r.br, key); err != nil {
-		return KeyValue{}, false
+		return KeyValue{}, false, fmt.Errorf("read key: %w", err)
 	}
 	if _, err := io.ReadFull(r.br, r.hdr[:]); err != nil {
-		return KeyValue{}, false
+		return KeyValue{}, false, fmt.Errorf("read value length: %w", err)
 	}
 	valLen := binary.BigEndian.Uint32(r.hdr[:])
 	val := make([]byte, valLen)
 	if _, err := io.ReadFull(r.br, val); err != nil {
-		return KeyValue{}, false
+		return KeyValue{}, false, fmt.Errorf("read value: %w", err)
 	}
-	return KeyValue{Key: string(key), Value: string(val)}, true
+	return KeyValue{Key: string(key), Value: string(val)}, true, nil
 }
 
 func (r *kvStreamReader) Close() {
@@ -385,11 +463,11 @@ func (r *kvStreamReader) Close() {
 
 // atomicWriteBinary writes sorted KV pairs as a gzip-compressed binary file.
 func atomicWriteBinary(path string, kvs []KeyValue) error {
-	_, err := atomicWriteBinaryWithStats(path, kvs, "")
+	_, err := atomicWriteBinaryWithStats(path, kvs, "", 0)
 	return err
 }
 
-func atomicWriteBinaryWithStats(path string, kvs []KeyValue, jobID string) (TaskMetrics, error) {
+func atomicWriteBinaryWithStats(path string, kvs []KeyValue, jobID string, attemptID int) (TaskMetrics, error) {
 	metrics := TaskMetrics{
 		ShuffleFiles:           1,
 		ShuffleJSONBytes:       estimateJSONLBytes(kvs),
@@ -401,10 +479,24 @@ func atomicWriteBinaryWithStats(path string, kvs []KeyValue, jobID string) (Task
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return metrics, err
 	}
-	f, err := os.Create(path)
+	target := path
+	if attemptID > 0 {
+		target = intermediateAttemptPath(path, attemptID)
+	}
+	tmp, err := tempPathFor(target)
 	if err != nil {
 		return metrics, err
 	}
+	f, err := os.Create(tmp)
+	if err != nil {
+		return metrics, err
+	}
+	cleanupTmp := true
+	defer func() {
+		if cleanupTmp {
+			_ = os.Remove(tmp)
+		}
+	}()
 
 	bw := bufio.NewWriterSize(f, 64*1024)
 	gw := gzip.NewWriter(bw)
@@ -419,14 +511,41 @@ func atomicWriteBinaryWithStats(path string, kvs []KeyValue, jobID string) (Task
 			return metrics, e
 		}
 	}
-	if err := os.WriteFile(readyPath(path, jobID), []byte("ready\n"), 0644); err != nil {
+	if err := atomicReplaceFile(tmp, target); err != nil {
 		return metrics, err
 	}
-	if info, err := os.Stat(path); err == nil {
+	cleanupTmp = false
+	if attemptID <= 0 {
+		if err := writeReadyMarker(readyPath(path, jobID), 0); err != nil {
+			return metrics, err
+		}
+	}
+	if info, err := os.Stat(target); err == nil {
 		metrics.ShuffleCompressedBytes = info.Size()
 	}
 	metrics.ShuffleWriteMs = time.Since(start).Milliseconds()
 	return metrics, nil
+}
+
+func tempPathFor(path string) (string, error) {
+	f, err := os.CreateTemp(filepath.Dir(path), filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	if err := f.Close(); err != nil {
+		_ = os.Remove(name)
+		return "", err
+	}
+	if err := os.Remove(name); err != nil {
+		return "", err
+	}
+	return name, nil
+}
+
+func atomicReplaceFile(src, dst string) error {
+	_ = os.Remove(dst)
+	return os.Rename(src, dst)
 }
 
 func readyPath(path, jobID string) string {
@@ -436,9 +555,133 @@ func readyPath(path, jobID string) string {
 	return fmt.Sprintf("%s.%s.ready", path, jobID)
 }
 
+func writeReadyMarker(path string, attemptID int) error {
+	content := "ready\n"
+	if attemptID > 0 {
+		content = fmt.Sprintf("attempt=%d\n", attemptID)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	tmp, err := tempPathFor(path)
+	if err != nil {
+		return err
+	}
+	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := atomicReplaceFile(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
+}
+
+func intermediateAttemptPath(path string, attemptID int) string {
+	if attemptID <= 0 {
+		return path
+	}
+	return fmt.Sprintf("%s.attempt-%d", path, attemptID)
+}
+
+func committedIntermediateAttempt(path, jobID string) (int, bool) {
+	marker, err := os.ReadFile(readyPath(path, jobID))
+	if err != nil {
+		return 0, false
+	}
+	text := strings.TrimSpace(string(marker))
+	if strings.HasPrefix(text, "attempt=") {
+		attemptID, err := strconv.Atoi(strings.TrimPrefix(text, "attempt="))
+		if err != nil || attemptID <= 0 {
+			return 0, false
+		}
+		return attemptID, true
+	}
+	return 0, true
+}
+
+func committedIntermediatePath(path, jobID string) (string, bool) {
+	attemptID, ok := committedIntermediateAttempt(path, jobID)
+	if !ok {
+		return "", false
+	}
+	if attemptID > 0 {
+		candidate := intermediateAttemptPath(path, attemptID)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate, true
+		}
+		return "", false
+	}
+	if _, err := os.Stat(path); err == nil {
+		return path, true
+	}
+	return "", false
+}
+
 func intermediateReady(path, jobID string) bool {
-	_, err := os.Stat(readyPath(path, jobID))
-	return err == nil
+	_, ok := committedIntermediatePath(path, jobID)
+	return ok
+}
+
+func publishMapOutputCommit(workDir, jobID string, mapID, nReduce, attemptID int) error {
+	if attemptID <= 0 {
+		return fmt.Errorf("invalid attempt id %d", attemptID)
+	}
+	for r := 0; r < nReduce; r++ {
+		path := intermediatePath(workDir, mapID, r)
+		if _, err := os.Stat(intermediateAttemptPath(path, attemptID)); err != nil {
+			return fmt.Errorf("map %d reduce %d attempt %d: %w", mapID, r, attemptID, err)
+		}
+	}
+	writtenMarkers := make([]struct {
+		path   string
+		marker string
+	}, 0, nReduce)
+	for r := 0; r < nReduce; r++ {
+		path := intermediatePath(workDir, mapID, r)
+		marker := readyPath(path, jobID)
+		if err := writeReadyMarker(marker, attemptID); err != nil {
+			for _, written := range writtenMarkers {
+				if committedAttempt, ok := committedIntermediateAttempt(written.path, jobID); ok && committedAttempt == attemptID {
+					_ = os.Remove(written.marker)
+				}
+			}
+			return fmt.Errorf("map %d reduce %d marker: %w", mapID, r, err)
+		}
+		writtenMarkers = append(writtenMarkers, struct {
+			path   string
+			marker string
+		}{path: path, marker: marker})
+	}
+	return nil
+}
+
+func reduceOutputPath(workDir string, reduceID int) string {
+	return filepath.Join(workDir, fmt.Sprintf("mr-out-%d", reduceID))
+}
+
+func reduceAttemptPath(workDir string, reduceID, attemptID int) string {
+	if attemptID <= 0 {
+		return reduceOutputPath(workDir, reduceID)
+	}
+	return fmt.Sprintf("%s.attempt-%d", reduceOutputPath(workDir, reduceID), attemptID)
+}
+
+func commitReduceOutput(workDir, jobID string, reduceID, attemptID int) error {
+	if attemptID <= 0 {
+		return fmt.Errorf("invalid attempt id %d", attemptID)
+	}
+	src := reduceAttemptPath(workDir, reduceID, attemptID)
+	dst := reduceOutputPath(workDir, reduceID)
+	if _, err := os.Stat(src); err != nil {
+		return err
+	}
+	if err := atomicReplaceFile(src, dst); err != nil {
+		return err
+	}
+	return writeReadyMarker(readyPath(dst, jobID), attemptID)
 }
 
 func writeBinaryKVs(w io.Writer, kvs []KeyValue) error {

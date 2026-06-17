@@ -24,7 +24,7 @@ func main() {
 			name = "plugin"
 		}
 		if err := mr.LoadPlugin(name, *pluginPath); err != nil {
-			log.Printf("Plugin load failed: %v, falling back to static UDF", err)
+			log.Fatalf("Plugin load failed: %v", err)
 		} else {
 			log.Printf("Plugin loaded: %s (prefix=%s)", *pluginPath, name)
 		}

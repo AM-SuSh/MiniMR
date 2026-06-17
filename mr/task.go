@@ -130,6 +130,7 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, m
 
 	if success {
 		task.State = Completed
+		task.CommittedAttemptID = task.AttemptID
 		task.LastFailureReason = ""
 		tm.job.Metrics.AddTask(metrics)
 		elapsed := time.Since(task.StartTime)
@@ -148,6 +149,7 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, m
 		})
 	} else {
 		task.State = Failed
+		task.CommittedAttemptID = 0
 		task.LastFailureReason = failureReason
 		tm.job.Metrics.TaskFailures++
 		failMsg := fmt.Sprintf("%s-%d 失败 (worker %s, attempt %d)", task.Type, task.ID, workerID, task.AttemptID)
@@ -188,14 +190,6 @@ func (tm *TaskManager) maybeCheckpointLocked(now time.Time) {
 	} else {
 		tm.lastCheckpointSave = now
 	}
-}
-
-func (tm *TaskManager) ResetTask(task *Task) {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	task.State = Idle
-	task.WorkerID = ""
-	task.StartTime = time.Time{}
 }
 
 // IsWorkerBlacklisted returns true if the worker has been flagged as unreliable.
@@ -307,6 +301,7 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 			}
 			tm.clearWorkerTaskLocked(task.WorkerID, task)
 			task.State = Idle
+			task.CommittedAttemptID = 0
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
 			return
@@ -331,6 +326,7 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 				tm.job.Metrics.SpeculativeRequeues++
 				tm.clearWorkerTaskLocked(task.WorkerID, task)
 				task.State = Idle
+				task.CommittedAttemptID = 0
 				task.WorkerID = ""
 				task.StartTime = time.Time{}
 			}
@@ -356,6 +352,7 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 			return
 		}
 		task.State = Idle
+		task.CommittedAttemptID = 0
 		task.WorkerID = ""
 		task.StartTime = time.Time{}
 	}
@@ -410,12 +407,14 @@ func (tm *TaskManager) abortTaskIfNeededLocked(task *Task, inProgress, pending *
 		}
 		task.AttemptID++
 		task.State = Failed
+		task.CommittedAttemptID = 0
 		task.WorkerID = ""
 		task.StartTime = time.Time{}
 		task.LastFailureReason = "job_aborted"
 	case Idle:
 		*pending++
 		task.State = Failed
+		task.CommittedAttemptID = 0
 		task.LastFailureReason = "job_aborted"
 	}
 }
@@ -460,6 +459,7 @@ func (tm *TaskManager) resetWorkerTasksLocked(workerID string) {
 			tm.job.Metrics.Retries++
 			tm.clearWorkerTaskLocked(workerID, task)
 			task.State = Idle
+			task.CommittedAttemptID = 0
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
 		}
@@ -470,6 +470,7 @@ func (tm *TaskManager) resetWorkerTasksLocked(workerID string) {
 			tm.job.Metrics.Retries++
 			tm.clearWorkerTaskLocked(workerID, task)
 			task.State = Idle
+			task.CommittedAttemptID = 0
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
 		}
@@ -480,42 +481,12 @@ func (tm *TaskManager) resetWorkerTasksLocked(workerID string) {
 // Query helpers
 // ---------------------------------------------------------------------------
 
-func (tm *TaskManager) IsJobComplete() bool {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	for _, t := range tm.job.MapTasks {
-		if t.State != Completed {
-			return false
-		}
-	}
-	for _, t := range tm.job.ReduceTasks {
-		if t.State != Completed {
-			return false
-		}
-	}
-	return true
-}
-
 func (tm *TaskManager) MarkMapDoneForReduce(mapID, reduceID int) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 	if mapID >= 0 && mapID < len(tm.job.MapDoneForReduce[reduceID]) {
 		tm.job.MapDoneForReduce[reduceID][mapID] = true
 	}
-}
-
-func (tm *TaskManager) IsReduceReady(reduceID int) bool {
-	tm.mu.Lock()
-	defer tm.mu.Unlock()
-	if reduceID < 0 || reduceID >= len(tm.job.MapDoneForReduce) {
-		return false
-	}
-	for _, done := range tm.job.MapDoneForReduce[reduceID] {
-		if !done {
-			return false
-		}
-	}
-	return true
 }
 
 // CanScheduleReduce returns true when the global map completion ratio meets the

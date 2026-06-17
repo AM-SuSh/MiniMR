@@ -5,7 +5,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"unicode"
 )
 
 var wordRe = regexp.MustCompile(`[a-zA-Z\p{Han}]+`)
@@ -44,9 +43,4 @@ func WordCountReduce(key string, values []string) string {
 		}
 	}
 	return strconv.Itoa(sum)
-}
-
-// isPunct checks if a rune is punctuation (for standalone mode).
-func isPunct(r rune) bool {
-	return unicode.IsPunct(r) || unicode.IsSymbol(r)
 }

@@ -1,6 +1,7 @@
 package mr
 
 import (
+	"compress/gzip"
 	"os"
 	"path/filepath"
 	"testing"
@@ -41,11 +42,15 @@ func TestSaveAndLoadCheckpoint(t *testing.T) {
 func TestReconcileMapFromWorkDir(t *testing.T) {
 	workDir := t.TempDir()
 	jobID := "reconcile-job"
+	dataDir := JobWorkDir(workDir, jobID)
 	nReduce := 2
 
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
 	// map-0 fully written
 	for r := 0; r < nReduce; r++ {
-		path := intermediatePath(workDir, 0, r)
+		path := intermediatePath(dataDir, 0, r)
 		if err := atomicWriteBinary(path, []KeyValue{{Key: "a", Value: "1"}}); err != nil {
 			t.Fatal(err)
 		}
@@ -83,6 +88,89 @@ func TestReconcileMapFromWorkDir(t *testing.T) {
 	}
 }
 
+func TestPublishMapOutputCommitChoosesAcceptedAttempt(t *testing.T) {
+	workDir := t.TempDir()
+	jobID := "commit-attempt"
+	dataDir := JobWorkDir(workDir, jobID)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	path := intermediatePath(dataDir, 0, 0)
+
+	if _, err := atomicWriteBinaryWithStats(path, []KeyValue{{Key: "old", Value: "1"}}, jobID, 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := atomicWriteBinaryWithStats(path, []KeyValue{{Key: "new", Value: "1"}}, jobID, 2); err != nil {
+		t.Fatal(err)
+	}
+	if err := publishMapOutputCommit(dataDir, jobID, 0, 1, 2); err != nil {
+		t.Fatal(err)
+	}
+
+	committed, ok := committedIntermediatePath(path, jobID)
+	if !ok {
+		t.Fatal("expected committed intermediate path")
+	}
+	r, err := openKVStream(committed)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	kv, ok, err := r.Next()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok || kv.Key != "new" {
+		t.Fatalf("expected committed attempt 2 data, got ok=%v kv=%+v", ok, kv)
+	}
+}
+
+func TestKVStreamReaderReportsTruncatedStream(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "broken")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gw := gzip.NewWriter(f)
+	if _, err := gw.Write([]byte{0, 0}); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	r, err := openKVStream(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	if _, _, err := r.Next(); err == nil {
+		t.Fatal("expected truncated stream error")
+	}
+}
+
+func TestReduceOutputReadyAcceptsCommittedEmptyOutput(t *testing.T) {
+	workDir := t.TempDir()
+	jobID := "empty-reduce"
+	dataDir := JobWorkDir(workDir, jobID)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	attemptPath := reduceAttemptPath(dataDir, 0, 1)
+	if err := os.WriteFile(attemptPath, nil, 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := commitReduceOutput(dataDir, jobID, 0, 1); err != nil {
+		t.Fatal(err)
+	}
+	if !reduceOutputReady(dataDir, jobID, 0) {
+		t.Fatal("empty committed reduce output should be ready")
+	}
+}
+
 func TestRecoverJobResumesScheduling(t *testing.T) {
 	root := t.TempDir()
 	cpDir := filepath.Join(root, "checkpoints")
@@ -94,8 +182,12 @@ func TestRecoverJobResumesScheduling(t *testing.T) {
 	if err := os.MkdirAll(workDir, 0755); err != nil {
 		t.Fatal(err)
 	}
+	dataDir := JobWorkDir(workDir, "recover-me")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		t.Fatal(err)
+	}
 	for r := 0; r < 1; r++ {
-		path := intermediatePath(workDir, 0, r)
+		path := intermediatePath(dataDir, 0, r)
 		if err := atomicWriteBinary(path, []KeyValue{{Key: "x", Value: "1"}}); err != nil {
 			t.Fatal(err)
 		}

@@ -64,6 +64,11 @@ def main():
               f"reduce={status['reduce_completed']}/{status['reduce_total']}")
         if status["state"] == "completed":
             break
+        if status["state"] == "failed":
+            print(f"Job failed: {status.get('error', '')}", file=sys.stderr)
+            sys.exit(1)
+        if status["state"] == "recoverable":
+            print("Job recoverable, waiting for master recovery...")
         time.sleep(2)
 
     result = get_result(args.master, job_id)

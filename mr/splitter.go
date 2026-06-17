@@ -2,6 +2,7 @@ package mr
 
 import (
 	"bufio"
+	"fmt"
 	"io"
 	"os"
 )
@@ -37,9 +38,8 @@ func SplitInput(files []string, splitSize int64) ([]Split, error) {
 			}
 
 			if offset+length < info.Size() {
-				// Advance to the next line boundary. If a line is extremely long,
-				// stop scanning after DefaultMaxSplitScan and only extend far
-				// enough to avoid cutting a UTF-8 rune in half.
+				// Advance to the next line boundary. Very long records are rejected
+				// instead of being silently split across map tasks.
 				if _, err := f.Seek(offset+length, io.SeekStart); err != nil {
 					f.Close()
 					return nil, err
@@ -62,12 +62,8 @@ func SplitInput(files []string, splitSize int64) ([]Split, error) {
 					}
 				}
 				if !foundLine && extra >= DefaultMaxSplitScan {
-					utf8Extra, err := utf8BoundaryExtra(f, offset+length+extra, info.Size())
-					if err != nil {
-						f.Close()
-						return nil, err
-					}
-					extra += utf8Extra
+					f.Close()
+					return nil, fmt.Errorf("line exceeds max split scan (%d bytes) near %s offset %d", DefaultMaxSplitScan, file, offset+length)
 				}
 				length += extra
 				if offset+length > info.Size() {
@@ -89,27 +85,4 @@ func SplitInput(files []string, splitSize int64) ([]Split, error) {
 		return []Split{}, nil
 	}
 	return splits, nil
-}
-
-func utf8BoundaryExtra(f *os.File, pos, size int64) (int64, error) {
-	if pos >= size {
-		return 0, nil
-	}
-	if _, err := f.Seek(pos, io.SeekStart); err != nil {
-		return 0, err
-	}
-	buf := make([]byte, 4)
-	n, err := f.Read(buf)
-	if err != nil && err != io.EOF {
-		return 0, err
-	}
-	extra := int64(0)
-	for extra < int64(n) && isUTF8Continuation(buf[extra]) {
-		extra++
-	}
-	return extra, nil
-}
-
-func isUTF8Continuation(b byte) bool {
-	return b&0xC0 == 0x80
 }

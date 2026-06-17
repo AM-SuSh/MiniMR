@@ -51,14 +51,3 @@ type HeartbeatArgs struct {
 type HeartbeatReply struct {
 	Acknowledged bool
 }
-
-// RegisterWorkerArgs registers a new Worker.
-type RegisterWorkerArgs struct {
-	WorkerID string
-	Address  string
-}
-
-// RegisterWorkerReply confirms registration.
-type RegisterWorkerReply struct {
-	OK bool
-}

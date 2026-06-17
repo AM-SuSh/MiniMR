@@ -24,7 +24,7 @@ func ClassifyFailure(reason string) FailureCategory {
 		return FailureInput
 	case strings.HasPrefix(reason, "config:"):
 		return FailureConfig
-	case strings.HasPrefix(reason, "intermediate_"), strings.HasPrefix(reason, "shuffle_"):
+	case strings.HasPrefix(reason, "intermediate_"), strings.HasPrefix(reason, "shuffle_"), strings.HasPrefix(reason, "output_"):
 		return FailureIntermediate
 	case reason == "":
 		return FailureWorker

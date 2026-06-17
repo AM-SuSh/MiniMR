@@ -49,6 +49,10 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 
 	config.NMap = len(splits)
 	config.WorkDir = workDir
+	dataDir := JobWorkDir(workDir, "local")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, err
+	}
 	job := &Job{
 		ID:               "local",
 		Config:           config,
@@ -81,7 +85,7 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 			MapFunc:     config.MapFunc,
 			ReduceFunc:  config.ReduceFunc,
 			CombineFunc: config.CombineFunc,
-			WorkDir:     workDir,
+			WorkDir:     dataDir,
 			JobID:       job.ID,
 			AttemptID:   1,
 		})
@@ -97,6 +101,14 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 			job.CompletedAt = time.Now()
 			return job, errors.New(job.Error)
 		}
+		if err := publishMapOutputCommit(dataDir, job.ID, i, config.NReduce, 1); err != nil {
+			job.State = JobFailed
+			job.Error = fmt.Sprintf("map-%d commit failed: %v", i, err)
+			job.CompletedAt = time.Now()
+			return job, errors.New(job.Error)
+		}
+		task.AttemptID = 1
+		task.CommittedAttemptID = 1
 		task.State = Completed
 		job.Metrics.AddTask(metrics)
 		for r := 0; r < config.NReduce; r++ {
@@ -114,7 +126,7 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 			NMap:       config.NMap,
 			ReduceID:   r,
 			ReduceFunc: config.ReduceFunc,
-			WorkDir:    workDir,
+			WorkDir:    dataDir,
 			JobID:      job.ID,
 			AttemptID:  1,
 		})
@@ -128,10 +140,18 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 			job.CompletedAt = time.Now()
 			return job, errors.New(job.Error)
 		}
+		if err := commitReduceOutput(dataDir, job.ID, r, 1); err != nil {
+			job.State = JobFailed
+			job.Error = fmt.Sprintf("reduce-%d commit failed: %v", r, err)
+			job.CompletedAt = time.Now()
+			return job, errors.New(job.Error)
+		}
 		job.Metrics.AddTask(metrics)
+		task.AttemptID = 1
+		task.CommittedAttemptID = 1
 		task.State = Completed
 
-		src := filepath.Join(workDir, fmt.Sprintf("mr-out-%d", r))
+		src := reduceOutputPath(dataDir, r)
 		dst := fmt.Sprintf("%s-%d", outputPrefix, r)
 		if err := copyFile(src, dst); err != nil {
 			return job, err

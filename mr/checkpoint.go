@@ -123,16 +123,17 @@ func (m *Master) LoadArchivedJobsFromCheckpoints() error {
 }
 
 type taskCheckpoint struct {
-	ID                int          `json:"id"`
-	Type              string       `json:"type"`
-	State             string       `json:"state"`
-	WorkerID          string       `json:"worker_id,omitempty"`
-	StartTime         time.Time    `json:"start_time,omitempty"`
-	MapInfo           *MapTaskInfo `json:"map_info,omitempty"`
-	ReduceID          int          `json:"reduce_id,omitempty"`
-	AttemptID         int          `json:"attempt_id"`
-	RetryCount        int          `json:"retry_count"`
-	LastFailureReason string       `json:"last_failure_reason,omitempty"`
+	ID                 int          `json:"id"`
+	Type               string       `json:"type"`
+	State              string       `json:"state"`
+	WorkerID           string       `json:"worker_id,omitempty"`
+	StartTime          time.Time    `json:"start_time,omitempty"`
+	MapInfo            *MapTaskInfo `json:"map_info,omitempty"`
+	ReduceID           int          `json:"reduce_id,omitempty"`
+	AttemptID          int          `json:"attempt_id"`
+	CommittedAttemptID int          `json:"committed_attempt_id,omitempty"`
+	RetryCount         int          `json:"retry_count"`
+	LastFailureReason  string       `json:"last_failure_reason,omitempty"`
 }
 
 type jobCheckpoint struct {
@@ -200,16 +201,17 @@ func jobToCheckpoint(job *Job, savedAt time.Time) jobCheckpoint {
 
 func taskToCheckpoint(t *Task) taskCheckpoint {
 	return taskCheckpoint{
-		ID:                t.ID,
-		Type:              t.Type.String(),
-		State:             t.State.String(),
-		WorkerID:          t.WorkerID,
-		StartTime:         t.StartTime,
-		MapInfo:           t.MapInfo,
-		ReduceID:          t.ReduceID,
-		AttemptID:         t.AttemptID,
-		RetryCount:        t.RetryCount,
-		LastFailureReason: t.LastFailureReason,
+		ID:                 t.ID,
+		Type:               t.Type.String(),
+		State:              t.State.String(),
+		WorkerID:           t.WorkerID,
+		StartTime:          t.StartTime,
+		MapInfo:            t.MapInfo,
+		ReduceID:           t.ReduceID,
+		AttemptID:          t.AttemptID,
+		CommittedAttemptID: t.CommittedAttemptID,
+		RetryCount:         t.RetryCount,
+		LastFailureReason:  t.LastFailureReason,
 	}
 }
 
@@ -275,6 +277,9 @@ func RebuildJobFromCheckpoint(jobID string) (*Job, error) {
 		return nil, fmt.Errorf("%w: job %s state=%s", ErrJobNotRecoverable, jobID, cp.State)
 	}
 	job := checkpointToJob(cp)
+	if err := os.MkdirAll(JobWorkDir(job.Config.WorkDir, job.ID), 0755); err != nil {
+		return nil, fmt.Errorf("job work dir: %w", err)
+	}
 	prepareInterruptedTasks(job)
 	reconcileJobFromWorkDir(job)
 	appendJobDecision(job, DecisionEvent{
@@ -329,16 +334,17 @@ func checkpointToTask(tc taskCheckpoint, defaultType TaskType) *Task {
 		typ = parsed
 	}
 	return &Task{
-		ID:                tc.ID,
-		Type:              typ,
-		State:             parseTaskState(tc.State),
-		WorkerID:          tc.WorkerID,
-		StartTime:         tc.StartTime,
-		MapInfo:           tc.MapInfo,
-		ReduceID:          tc.ReduceID,
-		AttemptID:         tc.AttemptID,
-		RetryCount:        tc.RetryCount,
-		LastFailureReason: tc.LastFailureReason,
+		ID:                 tc.ID,
+		Type:               typ,
+		State:              parseTaskState(tc.State),
+		WorkerID:           tc.WorkerID,
+		StartTime:          tc.StartTime,
+		MapInfo:            tc.MapInfo,
+		ReduceID:           tc.ReduceID,
+		AttemptID:          tc.AttemptID,
+		CommittedAttemptID: tc.CommittedAttemptID,
+		RetryCount:         tc.RetryCount,
+		LastFailureReason:  tc.LastFailureReason,
 	}
 }
 
@@ -350,6 +356,7 @@ func prepareInterruptedTasks(job *Job) {
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
 			task.AttemptID++
+			task.CommittedAttemptID = 0
 			task.LastFailureReason = ""
 		}
 	}
@@ -362,28 +369,42 @@ func prepareInterruptedTasks(job *Job) {
 }
 
 func reconcileJobFromWorkDir(job *Job) {
-	workDir := job.Config.WorkDir
+	dataDir := resolveJobDataDir(job.Config.WorkDir, job.ID)
 	nReduce := job.Config.NReduce
 	for _, task := range job.MapTasks {
-		if task.State == Completed {
-			continue
-		}
-		if mapOutputsReady(workDir, job.ID, task.ID, nReduce) {
+		if attemptID, ok := mapOutputsReady(dataDir, job.ID, task.ID, nReduce); ok {
 			task.State = Completed
+			task.CommittedAttemptID = attemptID
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
 			task.LastFailureReason = ""
 			for r := 0; r < nReduce; r++ {
 				job.MapDoneForReduce[r][task.ID] = true
 			}
+			continue
+		}
+		if task.State == Completed {
+			task.State = Idle
+			task.CommittedAttemptID = 0
+			task.WorkerID = ""
+			task.StartTime = time.Time{}
+			task.LastFailureReason = ""
+			for r := 0; r < nReduce; r++ {
+				job.MapDoneForReduce[r][task.ID] = false
+			}
 		}
 	}
 	for _, task := range job.ReduceTasks {
-		if task.State == Completed {
+		if reduceOutputReady(dataDir, job.ID, task.ReduceID) {
+			task.State = Completed
+			task.WorkerID = ""
+			task.StartTime = time.Time{}
+			task.LastFailureReason = ""
 			continue
 		}
-		if reduceOutputReady(workDir, task.ReduceID) {
-			task.State = Completed
+		if task.State == Completed {
+			task.State = Idle
+			task.CommittedAttemptID = 0
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
 			task.LastFailureReason = ""
@@ -391,18 +412,35 @@ func reconcileJobFromWorkDir(job *Job) {
 	}
 }
 
-func mapOutputsReady(workDir, jobID string, mapID, nReduce int) bool {
+func mapOutputsReady(dataDir, jobID string, mapID, nReduce int) (int, bool) {
+	committedAttempt := -1
 	for r := 0; r < nReduce; r++ {
-		path := intermediatePath(workDir, mapID, r)
-		if !intermediateReady(path, jobID) {
-			return false
+		path := intermediatePath(dataDir, mapID, r)
+		attemptID, ok := committedIntermediateAttempt(path, jobID)
+		if !ok {
+			return 0, false
+		}
+		if _, ok := committedIntermediatePath(path, jobID); !ok {
+			return 0, false
+		}
+		if committedAttempt == -1 {
+			committedAttempt = attemptID
+		} else if committedAttempt != attemptID {
+			return 0, false
 		}
 	}
-	return true
+	if committedAttempt < 0 {
+		committedAttempt = 0
+	}
+	return committedAttempt, true
 }
 
-func reduceOutputReady(workDir string, reduceID int) bool {
-	path := filepath.Join(workDir, fmt.Sprintf("mr-out-%d", reduceID))
+func reduceOutputReady(dataDir, jobID string, reduceID int) bool {
+	path := reduceOutputPath(dataDir, reduceID)
+	if _, err := os.Stat(readyPath(path, jobID)); err == nil {
+		_, err := os.Stat(path)
+		return err == nil
+	}
 	info, err := os.Stat(path)
 	return err == nil && info.Size() > 0
 }

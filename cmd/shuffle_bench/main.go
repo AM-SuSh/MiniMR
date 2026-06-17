@@ -14,6 +14,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 
 	"mapreduce/mr"
 
@@ -71,12 +72,8 @@ func main() {
 		})
 	}
 
-	if err := os.RemoveAll(*workDir); err != nil {
+	if err := prepareWorkDir(*workDir); err != nil {
 		fmt.Fprintf(os.Stderr, "clean workdir: %v\n", err)
-		os.Exit(1)
-	}
-	if err := os.MkdirAll(*workDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "mkdir: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -134,6 +131,20 @@ func main() {
 	fmt.Printf("\n基准文件目录: %s\n", *workDir)
 	fmt.Printf("复现命令: go run ./cmd/shuffle_bench -input %s -bytes %d -nreduce %d -workdir %s\n",
 		*input, *sampleBytes, *nReduce, *workDir)
+}
+
+func prepareWorkDir(dir string) error {
+	clean := filepath.Clean(dir)
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) || filepath.IsAbs(clean) {
+		return fmt.Errorf("workdir must be a relative mr-bench-* directory: %s", dir)
+	}
+	if !strings.HasPrefix(filepath.Base(clean), "mr-bench-") {
+		return fmt.Errorf("workdir base name must start with mr-bench-: %s", dir)
+	}
+	if err := os.RemoveAll(clean); err != nil {
+		return err
+	}
+	return os.MkdirAll(clean, 0755)
 }
 
 func readSample(path string, maxBytes int64) (string, int64, error) {

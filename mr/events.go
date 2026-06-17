@@ -17,7 +17,6 @@ const (
 	DecisionWorkerTimeout   DecisionType = "worker_timeout"
 	DecisionBlacklist       DecisionType = "blacklist"
 	DecisionReduceSlowStart DecisionType = "reduce_slow_start"
-	DecisionReduceReady     DecisionType = "reduce_ready"
 	DecisionJobFailed       DecisionType = "job_failed"
 	DecisionJobAborted      DecisionType = "job_aborted"
 	DecisionJobRecovered    DecisionType = "job_recovered"

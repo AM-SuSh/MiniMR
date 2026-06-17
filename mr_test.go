@@ -44,6 +44,19 @@ func TestSplitInput(t *testing.T) {
 	}
 }
 
+func TestSplitInputRejectsOverlongLine(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "input.txt")
+	content := strings.Repeat("a", mr.DefaultMaxSplitScan+2)
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := mr.SplitInput([]string{path}, 1); err == nil {
+		t.Fatal("expected overlong line to be rejected")
+	}
+}
+
 func TestWordCountUDF(t *testing.T) {
 	input := "hello world hello Go 分布式"
 	kvs := udf.WordCountMap("test", input)
@@ -93,11 +106,21 @@ func TestDistributedWordCount(t *testing.T) {
 	httpAddr := freePort(t)
 
 	master := mr.NewMaster(rpcAddr, httpAddr)
+	serveDone := make(chan error, 1)
 	go func() {
-		if err := master.Serve(); err != nil {
-			t.Logf("master serve: %v", err)
-		}
+		serveDone <- master.Serve()
 	}()
+	t.Cleanup(func() {
+		master.Shutdown()
+		select {
+		case err := <-serveDone:
+			if err != nil {
+				t.Errorf("master serve: %v", err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Error("master Serve did not stop after Shutdown")
+		}
+	})
 	time.Sleep(500 * time.Millisecond)
 
 	workDir := t.TempDir()
@@ -134,7 +157,7 @@ func TestDistributedWordCount(t *testing.T) {
 		t.Fatal("job did not complete in time")
 	}
 
-	counts := readOutputCounts(t, workDir, j.Config.NReduce)
+	counts := readOutputCounts(t, workDir, j.ID, j.Config.NReduce)
 	if counts["hello"] < 2 {
 		t.Fatalf("expected hello count >= 2, got %d (full: %v)", counts["hello"], counts)
 	}
@@ -381,11 +404,12 @@ func completeTasks(job *mr.Job) {
 	}
 }
 
-func readOutputCounts(t *testing.T, workDir string, nReduce int) map[string]int {
+func readOutputCounts(t *testing.T, workDir, jobID string, nReduce int) map[string]int {
 	t.Helper()
+	dataDir := mr.JobWorkDir(workDir, jobID)
 	counts := make(map[string]int)
 	for r := 0; r < nReduce; r++ {
-		path := filepath.Join(workDir, fmt.Sprintf("mr-out-%d", r))
+		path := filepath.Join(dataDir, fmt.Sprintf("mr-out-%d", r))
 		data, err := os.ReadFile(path)
 		if err != nil {
 			continue
@@ -405,27 +429,6 @@ func readOutputCounts(t *testing.T, workDir string, nReduce int) map[string]int 
 		}
 	}
 	return counts
-}
-
-func TestReduceReadyScheduling(t *testing.T) {
-	job := &mr.Job{
-		Config: mr.JobConfig{NMap: 2, NReduce: 2},
-		MapDoneForReduce: [][]bool{
-			{false, false},
-			{false, false},
-		},
-	}
-	tm := mr.NewTaskManager(job)
-	tm.MarkMapDoneForReduce(0, 0)
-	tm.MarkMapDoneForReduce(0, 1)
-
-	if tm.IsReduceReady(0) {
-		t.Fatal("reduce 0 should not be ready yet")
-	}
-	tm.MarkMapDoneForReduce(1, 0)
-	if !tm.IsReduceReady(0) {
-		t.Fatal("reduce 0 should be ready")
-	}
 }
 
 func TestReduceSlowStartScheduling(t *testing.T) {

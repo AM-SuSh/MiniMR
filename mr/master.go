@@ -11,21 +11,23 @@ import (
 	"net/http"
 	"net/rpc"
 	"os"
-	"path/filepath"
 	"sync"
 	"time"
 )
 
 // Master coordinates job scheduling, RPC, and HTTP API.
 type Master struct {
-	mu       sync.Mutex
-	jobs     map[string]*Job //JobID-Job
-	current  *Job            //当前正在执行的作业（简化版只执行单作业，即同一时间Master只处理一个作业）
-	tm       *TaskManager    //任务管理器：跟踪任务分配、超时、重试
-	starting bool            // true while StartJob is preparing splits for the next active job
-	rpcAddr  string
-	httpAddr string
-	done     chan struct{} //关闭信号，用于停止服务。
+	mu           sync.Mutex
+	jobs         map[string]*Job
+	current      *Job
+	tm           *TaskManager
+	starting     bool
+	rpcAddr      string
+	httpAddr     string
+	rpcListener  net.Listener
+	httpServer   *http.Server
+	done         chan struct{}
+	shutdownOnce sync.Once
 }
 
 var ErrJobAlreadyRunning = errors.New("job already running")
@@ -97,6 +99,10 @@ func (m *Master) StartJob(config JobConfig) (*Job, error) {
 
 	config.NMap = len(splits)
 	jobID := generateJobID()
+	if err := os.MkdirAll(JobWorkDir(config.WorkDir, jobID), 0755); err != nil {
+		releaseReservation()
+		return nil, err
+	}
 	job := &Job{
 		ID:               jobID,
 		Config:           config,
@@ -224,10 +230,6 @@ func (m *Master) canStartJobLocked(now time.Time) error {
 	if m.current == nil || m.current.State == JobCompleted || m.current.State == JobFailed {
 		return nil
 	}
-	if m.tm != nil {
-		m.tm.mu.Lock()
-		defer m.tm.mu.Unlock()
-	}
 	if m.allTasksCompleteLocked(m.current) {
 		m.completeJobLocked(m.current, now)
 		return nil
@@ -352,7 +354,7 @@ func (m *Master) assignTaskLocked(job *Job, task *Task, workerID string, reply *
 	reply.MapFunc = job.Config.MapFunc
 	reply.ReduceFunc = job.Config.ReduceFunc
 	reply.CombineFunc = job.Config.CombineFunc
-	reply.WorkDir = job.Config.WorkDir
+	reply.WorkDir = JobWorkDir(job.Config.WorkDir, job.ID)
 	reply.JobID = job.ID
 	reply.JobState = job.State.String()
 	reply.ReduceID = task.ReduceID
@@ -428,11 +430,22 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 	}
 
 	if args.Success {
-		m.tm.CompleteTask(task, true, args.WorkerID, args.Metrics, "")
+		dataDir := JobWorkDir(job.Config.WorkDir, job.ID)
 		if args.TaskType == MapTask {
+			if err := publishMapOutputCommit(dataDir, job.ID, args.TaskID, job.Config.NReduce, args.AttemptID); err != nil {
+				m.tm.CompleteTask(task, false, args.WorkerID, args.Metrics, fmt.Sprintf("intermediate_commit: %v", err))
+				return nil
+			}
+			m.tm.CompleteTask(task, true, args.WorkerID, args.Metrics, "")
 			for r := 0; r < job.Config.NReduce; r++ {
 				m.tm.MarkMapDoneForReduce(args.TaskID, r)
 			}
+		} else if args.TaskType == ReduceTask {
+			if err := commitReduceOutput(dataDir, job.ID, task.ReduceID, args.AttemptID); err != nil {
+				m.tm.CompleteTask(task, false, args.WorkerID, args.Metrics, fmt.Sprintf("output_commit: %v", err))
+				return nil
+			}
+			m.tm.CompleteTask(task, true, args.WorkerID, args.Metrics, "")
 		}
 	} else {
 		m.tm.CompleteTask(task, false, args.WorkerID, args.Metrics, args.FailureReason)
@@ -468,6 +481,9 @@ func (m *Master) Serve() error {
 	if err != nil {
 		return fmt.Errorf("rpc listen: %w", err)
 	}
+	m.mu.Lock()
+	m.rpcListener = l
+	m.mu.Unlock()
 	log.Printf("Master RPC listening on %s", m.rpcAddr)
 
 	go func() {
@@ -495,6 +511,11 @@ func (m *Master) Serve() error {
 	mux.HandleFunc("/api/dashboard", m.withCORS(m.handleDashboard))
 	mux.Handle("/", http.FileServer(http.Dir("web")))
 
+	httpServer := &http.Server{Addr: m.httpAddr, Handler: mux}
+	m.mu.Lock()
+	m.httpServer = httpServer
+	m.mu.Unlock()
+
 	log.Printf("Master HTTP listening on %s (dashboard: http://localhost%s/)", m.httpAddr, m.httpAddr)
 	if err := m.LoadArchivedJobsFromCheckpoints(); err != nil {
 		log.Printf("checkpoint archive load: %v", err)
@@ -508,11 +529,26 @@ func (m *Master) Serve() error {
 				j.ID, j.MapDone, j.MapTotal, j.ReduceDone, j.ReduceTotal, j.SavedAt.Format(time.RFC3339))
 		}
 	}
-	return http.ListenAndServe(m.httpAddr, mux)
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	return nil
 }
 
 func (m *Master) Shutdown() {
-	close(m.done)
+	m.shutdownOnce.Do(func() {
+		close(m.done)
+		m.mu.Lock()
+		rpcListener := m.rpcListener
+		httpServer := m.httpServer
+		m.mu.Unlock()
+		if rpcListener != nil {
+			_ = rpcListener.Close()
+		}
+		if httpServer != nil {
+			_ = httpServer.Close()
+		}
+	})
 }
 
 type submitJobRequest struct {
@@ -744,14 +780,9 @@ func (m *Master) handleStatus(w http.ResponseWriter, r *http.Request) {
 	state := job.State.String()
 	switch job.State {
 	case JobFailed, JobCompleted:
-		// Terminal states must not be overwritten by progress heuristics.
 	default:
 		if m.allTasksCompleteLocked(job) {
-			m.completeJobLocked(job, time.Now())
 			state = JobCompleted.String()
-		} else if mapDone < mapTotal || reduceDone < reduceTotal {
-			job.State = JobRunning
-			state = JobRunning.String()
 		}
 	}
 	errMsg := job.Error
@@ -793,9 +824,10 @@ func (m *Master) handleResult(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	jobDataDir := JobWorkDir(job.Config.WorkDir, job.ID)
 	var outputFiles []string
 	for rID := 0; rID < job.Config.NReduce; rID++ {
-		outputFiles = append(outputFiles, filepath.Join(job.Config.WorkDir, fmt.Sprintf("mr-out-%d", rID)))
+		outputFiles = append(outputFiles, reduceOutputPath(jobDataDir, rID))
 	}
 
 	w.Header().Set("Content-Type", "application/json")
@@ -804,6 +836,7 @@ func (m *Master) handleResult(w http.ResponseWriter, r *http.Request) {
 		"state":        job.State.String(),
 		"output_files": outputFiles,
 		"work_dir":     job.Config.WorkDir,
+		"job_work_dir": jobDataDir,
 	})
 }
 

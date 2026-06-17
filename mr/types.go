@@ -198,16 +198,17 @@ type MapTaskInfo struct {
 
 // Task represents a schedulable unit of work.
 type Task struct {
-	ID                int
-	Type              TaskType
-	State             TaskState
-	WorkerID          string
-	StartTime         time.Time
-	MapInfo           *MapTaskInfo
-	ReduceID          int
-	AttemptID         int // monotonically increasing; each (re)assignment bumps this
-	RetryCount        int // incremented on hard timeout or explicit failure
-	LastFailureReason string
+	ID                 int
+	Type               TaskType
+	State              TaskState
+	WorkerID           string
+	StartTime          time.Time
+	MapInfo            *MapTaskInfo
+	ReduceID           int
+	AttemptID          int // monotonically increasing; each (re)assignment bumps this
+	CommittedAttemptID int // accepted attempt whose output is published for downstream readers
+	RetryCount         int // incremented on hard timeout or explicit failure
+	LastFailureReason  string
 }
 
 // WorkerInfo tracks a registered worker.
