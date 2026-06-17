@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=history" />
+  <link rel="stylesheet" href="styles.css?v=layout" />
 </head>
 <body>
   <header class="top-nav">
@@ -170,14 +170,18 @@
           </div>
         </section>
 
-        <!-- Map / Reduce -->
-        <section class="bento-map card">
+        <!-- Map → Shuffle → Reduce（与流水线顺序一致） -->
+        <section class="bento-map card card--stage">
           <header class="card-header"><div><p class="label">分片计算</p><h2>Map 任务</h2></div></header>
-          <div id="map-tasks" class="task-grid"></div>
+          <div id="map-tasks" class="task-grid task-grid--map"></div>
         </section>
-        <section class="bento-reduce card">
+        <section class="bento-partition card card--stage">
+          <header class="card-header"><div><p class="label">中间文件就绪</p><h2>Shuffle 分区</h2></div></header>
+          <div id="partition-grid" class="partition-grid"></div>
+        </section>
+        <section class="bento-reduce card card--stage">
           <header class="card-header"><div><p class="label">聚合输出</p><h2>Reduce 任务</h2></div></header>
-          <div id="reduce-tasks" class="task-grid"></div>
+          <div id="reduce-tasks" class="task-grid task-grid--reduce"></div>
         </section>
 
         <!-- Worker -->
@@ -217,11 +221,6 @@
           </div>
         </section>
 
-        <!-- 分区 | 配置 -->
-        <section class="bento-partition card">
-          <header class="card-header"><div><p class="label">中间文件就绪</p><h2>Shuffle 分区</h2></div></header>
-          <div id="partition-grid" class="partition-grid"></div>
-        </section>
         <aside class="bento-side">
           <section class="card card--compact">
             <header class="card-header"><div><p class="label">作业配置</p><h2>参数</h2></div></header>
@@ -242,6 +241,6 @@
     <span>MiniMR Dashboard</span>
   </footer>
 
-  <script src="app.js?v=history"></script>
+  <script src="app.js?v=layout"></script>
 </body>
 </html>
