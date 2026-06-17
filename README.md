@@ -95,7 +95,13 @@ go test ./... -v -count=1
 
 - **Reduce 提前调度**：某 reduce 分区所有 Map 输出就绪即可开始 Reduce
 - **Combine**：Map 端本地预聚合，减少 Shuffle 数据量
-- **Shuffle 优化**：Map 端按 key 排序写入，Reduce 端归并
+- **Shuffle 优化**：
+      - 二进制编码
+      - gzip压缩
+      ```
+      go run ./cmd/shuffle_bench -nreduce 5
+      ```
+      - Map 端按 key 排序写入，Reduce 端归并
 - **容错**：任务超时重分配、Worker 心跳检测、中间文件原子写入
 
 ## 环境要求

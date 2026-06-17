@@ -1,12 +1,9 @@
-// 单机模式入口 — 向后兼容，无需 Master/Worker 即可运行 WordCount。
 package main
 
 import (
 	"flag"
 	"fmt"
 	"log"
-	"os"
-	"sort"
 
 	"mapreduce/mr"
 
@@ -14,97 +11,62 @@ import (
 )
 
 func main() {
-	input := flag.String("input", "testdata/input.txt", "Input file")               //输入文件路径
-	output := flag.String("output", "mr-out-standalone", "Output file prefix")      // 输出前缀
-	nReduce := flag.Int("nreduce", 3, "Number of reduce partitions")                // reduce任务数
-	udfName := flag.String("udf", "wordcount", "UDF set: wordcount or crawl_clean") // 要使用的函数集（通过udfName决定加载哪种算法，通过mr包提供的注册机制获取具体的业务逻辑函数）
+	input := flag.String("input", "testdata/input.txt", "Input file")
+	output := flag.String("output", "mr-out-standalone", "Output file prefix")
+	nReduce := flag.Int("nreduce", 3, "Number of reduce partitions")
+	udfName := flag.String("udf", "wordcount", "UDF set: wordcount or crawl_clean")
+	splitSize := flag.Int64("split", 0, "Split size in bytes (0 = default 32 MiB)")
 	flag.Parse()
 
-	var mapFn, reduceFn, combineFn string
-	switch *udfName {
-	case "crawl_clean":
-		mapFn, reduceFn, combineFn = "crawl_clean_map", "crawl_clean_reduce", ""
-	default:
-		mapFn, reduceFn, combineFn = "wordcount_map", "wordcount_reduce", "wordcount_combine"
-	}
-
-	content, err := os.ReadFile(*input)
+	mapFn, reduceFn, combineFn := resolveUDF(*udfName)
+	job, err := mr.RunLocal(mr.JobConfig{
+		InputFiles:  []string{*input},
+		NReduce:     *nReduce,
+		MapFunc:     mapFn,
+		ReduceFunc:  reduceFn,
+		CombineFunc: combineFn,
+		SplitSize:   *splitSize,
+	}, *output)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	// Map phase
-	mapFunc, _ := mr.GetMapFunc(mapFn)
-	kvs := mapFunc(*input, string(content))
-
-	if combineFn != "" {
-		if cf, ok := mr.GetCombineFunc(combineFn); ok {
-			kvs = combineInProcess(kvs, cf)
-		}
+	fmt.Printf("Completed local job: %d map tasks, %d reduce tasks\n", job.Config.NMap, job.Config.NReduce)
+	for r := 0; r < job.Config.NReduce; r++ {
+		fmt.Printf("Wrote %s-%d\n", *output, r)
 	}
-
-	partitions := make([][]mr.KeyValue, *nReduce)
-	for _, kv := range kvs {
-		r := ihash(kv.Key) % *nReduce
-		partitions[r] = append(partitions[r], kv)
-	}
-
-	reduceFunc, _ := mr.GetReduceFunc(reduceFn)
-	for r := 0; r < *nReduce; r++ {
-		sort.Slice(partitions[r], func(i, j int) bool {
-			return partitions[r][i].Key < partitions[r][j].Key
-		})
-
-		outPath := fmt.Sprintf("%s-%d", *output, r)
-		f, err := os.Create(outPath)
-		if err != nil {
-			log.Fatal(err)
-		}
-		i := 0
-		vals := partitions[r]
-		for i < len(vals) {
-			key := vals[i].Key
-			j := i + 1
-			for j < len(vals) && vals[j].Key == key {
-				j++
-			}
-			values := make([]string, j-i)
-			for k := i; k < j; k++ {
-				values[k-i] = vals[k].Value
-			}
-			fmt.Fprintf(f, "%s\t%s\n", key, reduceFunc(key, values))
-			i = j
-		}
-		f.Close()
-		fmt.Printf("Wrote %s\n", outPath)
-	}
-
+	printOptimizationSummary(job.Metrics)
 }
 
-func combineInProcess(kvs []mr.KeyValue, combineFn mr.CombineFunc) []mr.KeyValue {
-	sort.Slice(kvs, func(i, j int) bool { return kvs[i].Key < kvs[j].Key })
-	var result []mr.KeyValue
-	i := 0
-	for i < len(kvs) {
-		key := kvs[i].Key
-		j := i + 1
-		for j < len(kvs) && kvs[j].Key == key {
-			j++
-		}
-		values := make([]string, j-i)
-		for k := i; k < j; k++ {
-			values[k-i] = kvs[k].Value
-		}
-		result = append(result, mr.KeyValue{Key: key, Value: combineFn(key, values)})
-		i = j
+func resolveUDF(name string) (mapFn, reduceFn, combineFn string) {
+	switch name {
+	case "crawl_clean":
+		return "crawl_clean_map", "crawl_clean_reduce", ""
+	default:
+		return "wordcount_map", "wordcount_reduce", "wordcount_combine"
 	}
-	return result
 }
 
-func ihash(key string) int {
-	h := uint32(2166136261)
-	for i := 0; i < len(key); i++ {
-		h = h*16777619 ^ uint32(key[i])
+func printOptimizationSummary(m mr.JobMetrics) {
+	fmt.Println("Optimization summary:")
+	if m.ShuffleJSONBytes > 0 {
+		saved := 100 * (1 - float64(m.ShuffleCompressedBytes)/float64(m.ShuffleJSONBytes))
+		fmt.Printf("  shuffle: JSONL %s -> binary+gzip %s (saved %.1f%%)\n",
+			humanBytes(m.ShuffleJSONBytes), humanBytes(m.ShuffleCompressedBytes), saved)
 	}
-	return int(h)
+	fmt.Printf("  streaming reduce: %d records -> %d keys, max buffered values/key %d\n",
+		m.ReduceStreamedRecords, m.ReduceOutputKeys, m.ReduceMaxBufferedValues)
+}
+
+func humanBytes(n int64) string {
+	const unit = 1024
+	if n < unit {
+		return fmt.Sprintf("%d B", n)
+	}
+	div, exp := int64(unit), 0
+	for v := n / unit; v >= unit; v /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.2f %cB", float64(n)/float64(div), "KMGTPE"[exp])
 }

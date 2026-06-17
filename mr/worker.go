@@ -42,11 +42,11 @@ func (w *Worker) Run() {
 
 		switch reply.TaskType {
 		case MapTask:
-			success := w.doMap(reply)
-			w.report(reply.JobID, MapTask, reply.TaskID, reply.AttemptID, success)
+			success, metrics := w.doMap(reply)
+			w.report(reply.JobID, MapTask, reply.TaskID, reply.AttemptID, success, metrics)
 		case ReduceTask:
-			success := w.doReduce(reply)
-			w.report(reply.JobID, ReduceTask, reply.TaskID, reply.AttemptID, success)
+			success, metrics := w.doReduce(reply)
+			w.report(reply.JobID, ReduceTask, reply.TaskID, reply.AttemptID, success, metrics)
 		case WaitTask:
 			time.Sleep(time.Second)
 		case ExitTask:
@@ -67,7 +67,7 @@ func (w *Worker) heartbeatLoop() {
 	}
 }
 
-func (w *Worker) report(jobID string, taskType TaskType, taskID int, attemptID int, success bool) {
+func (w *Worker) report(jobID string, taskType TaskType, taskID int, attemptID int, success bool, metrics TaskMetrics) {
 	var reply ReportTaskReply
 	_ = w.call("Master.ReportTask", &ReportTaskArgs{
 		WorkerID:  w.ID,
@@ -76,6 +76,7 @@ func (w *Worker) report(jobID string, taskType TaskType, taskID int, attemptID i
 		TaskID:    taskID,
 		AttemptID: attemptID,
 		Success:   success,
+		Metrics:   metrics,
 	}, &reply)
 }
 
@@ -83,26 +84,29 @@ func (w *Worker) report(jobID string, taskType TaskType, taskID int, attemptID i
 // Map task: read split → MapFunc → Combine → partition → sort → write binary
 // ---------------------------------------------------------------------------
 
-func (w *Worker) doMap(reply RequestTaskReply) bool {
+func (w *Worker) doMap(reply RequestTaskReply) (bool, TaskMetrics) {
+	metrics := TaskMetrics{InputBytes: reply.InputLength}
 	mapFn, ok := GetMapFunc(reply.MapFunc)
 	if !ok {
 		log.Printf("unknown map func: %s", reply.MapFunc)
-		return false
+		return false, metrics
 	}
 
 	content, err := readSplit(reply.InputFile, reply.InputOffset, reply.InputLength)
 	if err != nil {
 		log.Printf("read split: %v", err)
-		return false
+		return false, metrics
 	}
 
 	kvs := mapFn(reply.InputFile, content)
+	metrics.MapOutputRecords = int64(len(kvs))
 
 	if reply.CombineFunc != "" {
 		if combineFn, ok := GetCombineFunc(reply.CombineFunc); ok {
 			kvs = combineLocal(kvs, combineFn)
 		}
 	}
+	metrics.CombineOutputRecords = int64(len(kvs))
 
 	partitions := make([][]KeyValue, reply.NReduce)
 	for _, kv := range kvs {
@@ -115,26 +119,30 @@ func (w *Worker) doMap(reply RequestTaskReply) bool {
 			return partitions[r][i].Key < partitions[r][j].Key
 		})
 		outPath := intermediatePath(reply.WorkDir, reply.TaskID, r)
-		if err := atomicWriteBinary(outPath, partitions[r]); err != nil {
+		fileMetrics, err := atomicWriteBinaryWithStats(outPath, partitions[r], reply.JobID)
+		if err != nil {
 			log.Printf("write intermediate %s: %v", outPath, err)
-			return false
+			return false, metrics
 		}
+		metrics.Add(fileMetrics)
 	}
-	return true
+	return true, metrics
 }
 
 // ---------------------------------------------------------------------------
 // Reduce task: shuffle (poll files) → K-way heap merge → streaming reduce
 // ---------------------------------------------------------------------------
 
-func (w *Worker) doReduce(reply RequestTaskReply) bool {
+func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics) {
+	metrics := TaskMetrics{}
 	reduceFn, ok := GetReduceFunc(reply.ReduceFunc)
 	if !ok {
 		log.Printf("unknown reduce func: %s", reply.ReduceFunc)
-		return false
+		return false, metrics
 	}
 
 	// Phase 1  Shuffle — poll until every intermediate file is present.
+	shuffleStart := time.Now()
 	collected := make([]bool, reply.NMap)
 	collectCount := 0
 	shuffleDeadline := time.Now().Add(ReduceShuffleTimeout)
@@ -145,7 +153,7 @@ func (w *Worker) doReduce(reply RequestTaskReply) bool {
 				continue
 			}
 			path := intermediatePath(reply.WorkDir, m, reply.ReduceID)
-			if _, err := os.Stat(path); err == nil {
+			if intermediateReady(path, reply.JobID) {
 				collected[m] = true
 				collectCount++
 			}
@@ -156,10 +164,12 @@ func (w *Worker) doReduce(reply RequestTaskReply) bool {
 		if time.Now().After(shuffleDeadline) {
 			log.Printf("reduce %d: shuffle timed out (%d/%d files collected)",
 				reply.ReduceID, collectCount, reply.NMap)
-			return false
+			metrics.ShuffleWaitMs = time.Since(shuffleStart).Milliseconds()
+			return false, metrics
 		}
 		time.Sleep(ReduceShufflePollInterval)
 	}
+	metrics.ShuffleWaitMs = time.Since(shuffleStart).Milliseconds()
 
 	// Phase 2  Open K sorted streams and seed the min-heap.
 	readers := make([]*kvStreamReader, reply.NMap)
@@ -173,9 +183,10 @@ func (w *Worker) doReduce(reply RequestTaskReply) bool {
 					rr.Close()
 				}
 			}
-			return false
+			return false, metrics
 		}
 		readers[m] = r
+		metrics.ReduceOpenedStreams++
 	}
 	defer func() {
 		for _, r := range readers {
@@ -197,32 +208,37 @@ func (w *Worker) doReduce(reply RequestTaskReply) bool {
 	outPath := filepath.Join(reply.WorkDir, fmt.Sprintf("mr-out-%d", reply.ReduceID))
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
 		log.Printf("mkdir: %v", err)
-		return false
+		return false, metrics
 	}
-	tmp := outPath + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.Create(outPath)
 	if err != nil {
-		log.Printf("create %s: %v", tmp, err)
-		return false
+		log.Printf("create %s: %v", outPath, err)
+		return false, metrics
 	}
 	bw := bufio.NewWriterSize(f, 64*1024)
 
 	var curKey string
 	var curVals []string
 	first := true
+	streamStart := time.Now()
 
 	for mh.Len() > 0 {
 		item := heap.Pop(mh).(mergeItem)
+		metrics.ReduceStreamedRecords++
 
 		if first || item.kv.Key != curKey {
 			if !first {
 				fmt.Fprintf(bw, "%s\t%s\n", curKey, reduceFn(curKey, curVals))
+				metrics.ReduceOutputKeys++
 			}
 			curKey = item.kv.Key
 			curVals = curVals[:0]
 			first = false
 		}
 		curVals = append(curVals, item.kv.Value)
+		if int64(len(curVals)) > metrics.ReduceMaxBufferedValues {
+			metrics.ReduceMaxBufferedValues = int64(len(curVals))
+		}
 
 		if kv, ok := readers[item.streamID].Next(); ok {
 			heap.Push(mh, mergeItem{kv: kv, streamID: item.streamID})
@@ -230,18 +246,20 @@ func (w *Worker) doReduce(reply RequestTaskReply) bool {
 	}
 	if !first && len(curVals) > 0 {
 		fmt.Fprintf(bw, "%s\t%s\n", curKey, reduceFn(curKey, curVals))
+		metrics.ReduceOutputKeys++
 	}
+	metrics.ReduceReadMs = time.Since(streamStart).Milliseconds()
 
+	writeStart := time.Now()
 	if err := bw.Flush(); err != nil {
 		f.Close()
-		os.Remove(tmp)
-		return false
+		return false, metrics
 	}
 	if err := f.Close(); err != nil {
-		os.Remove(tmp)
-		return false
+		return false, metrics
 	}
-	return os.Rename(tmp, outPath) == nil
+	metrics.ReduceWriteMs = time.Since(writeStart).Milliseconds()
+	return true, metrics
 }
 
 // ===========================================================================
@@ -347,14 +365,25 @@ func (r *kvStreamReader) Close() {
 
 // atomicWriteBinary writes sorted KV pairs as a gzip-compressed binary file.
 func atomicWriteBinary(path string, kvs []KeyValue) error {
+	_, err := atomicWriteBinaryWithStats(path, kvs, "")
+	return err
+}
+
+func atomicWriteBinaryWithStats(path string, kvs []KeyValue, jobID string) (TaskMetrics, error) {
+	metrics := TaskMetrics{
+		ShuffleFiles:           1,
+		ShuffleJSONBytes:       estimateJSONLBytes(kvs),
+		ShuffleBinaryBytes:     estimateBinaryBytes(kvs),
+		ShuffleCompressedBytes: 0,
+	}
+	start := time.Now()
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
+		return metrics, err
 	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	f, err := os.Create(path)
 	if err != nil {
-		return err
+		return metrics, err
 	}
 
 	bw := bufio.NewWriterSize(f, 64*1024)
@@ -367,11 +396,29 @@ func atomicWriteBinary(path string, kvs []KeyValue) error {
 
 	for _, e := range []error{writeErr, gzErr, flushErr, fErr} {
 		if e != nil {
-			os.Remove(tmp)
-			return e
+			return metrics, e
 		}
 	}
-	return os.Rename(tmp, path)
+	if err := os.WriteFile(readyPath(path, jobID), []byte("ready\n"), 0644); err != nil {
+		return metrics, err
+	}
+	if info, err := os.Stat(path); err == nil {
+		metrics.ShuffleCompressedBytes = info.Size()
+	}
+	metrics.ShuffleWriteMs = time.Since(start).Milliseconds()
+	return metrics, nil
+}
+
+func readyPath(path, jobID string) string {
+	if jobID == "" {
+		return path + ".ready"
+	}
+	return fmt.Sprintf("%s.%s.ready", path, jobID)
+}
+
+func intermediateReady(path, jobID string) bool {
+	_, err := os.Stat(readyPath(path, jobID))
+	return err == nil
 }
 
 func writeBinaryKVs(w io.Writer, kvs []KeyValue) error {
@@ -393,6 +440,44 @@ func writeBinaryKVs(w io.Writer, kvs []KeyValue) error {
 		}
 	}
 	return nil
+}
+
+func estimateBinaryBytes(kvs []KeyValue) int64 {
+	var n int64
+	for _, kv := range kvs {
+		n += int64(8 + len(kv.Key) + len(kv.Value))
+	}
+	return n
+}
+
+func estimateJSONLBytes(kvs []KeyValue) int64 {
+	var n int64
+	for _, kv := range kvs {
+		// encoding/json would produce {"Key":"...","Value":"..."}\n for
+		// wordcount keys. Account for common escaping so the dashboard remains
+		// honest for paths and crawled text too.
+		n += int64(22 + escapedJSONStringLen(kv.Key) + escapedJSONStringLen(kv.Value))
+	}
+	return n
+}
+
+func escapedJSONStringLen(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\', '"':
+			n += 2
+		case '\n', '\r', '\t':
+			n += 2
+		default:
+			if s[i] < 0x20 {
+				n += 6
+			} else {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // ===========================================================================

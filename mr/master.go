@@ -126,18 +126,29 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 		m.tm.RegisterWorker(args.WorkerID)
 	}
 
-	if job.State == JobFailed {
-		reply.TaskType = ExitTask
-		return nil
-	}
-
 	if m.tm.IsWorkerBlacklisted(args.WorkerID) {
 		log.Printf("worker %s is blacklisted, sending exit", args.WorkerID)
 		reply.TaskType = ExitTask
 		return nil
 	}
 
-	// Prefer map tasks.
+	if job.State == JobFailed || job.State == JobCompleted {
+		reply.TaskType = WaitTask
+		return nil
+	}
+
+	reduceUnlocked := m.tm.CanScheduleReduce()
+	if reduceUnlocked && m.tm.CanLaunchEarlyReduce() {
+		for _, task := range job.ReduceTasks {
+			if task.State == Idle {
+				m.assignTaskLocked(job, task, args.WorkerID, reply)
+				return nil
+			}
+		}
+	}
+
+	// Prefer map tasks while slow-start reducers are already occupying their
+	// worker budget.
 	for _, task := range job.MapTasks {
 		if task.State == Idle {
 			m.assignTaskLocked(job, task, args.WorkerID, reply)
@@ -148,7 +159,7 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 	// Reduce slow start: schedule reduce when map completion ratio >= threshold,
 	// allowing the reduce worker to begin its shuffle phase (polling for
 	// intermediate files) while remaining maps are still running.
-	if m.tm.CanScheduleReduce() {
+	if reduceUnlocked {
 		for _, task := range job.ReduceTasks {
 			if task.State == Idle {
 				m.assignTaskLocked(job, task, args.WorkerID, reply)
@@ -158,7 +169,7 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 	}
 
 	if m.allTasksCompleteLocked(job) {
-		reply.TaskType = ExitTask
+		reply.TaskType = WaitTask
 		job.State = JobCompleted
 		job.CompletedAt = time.Now()
 		return nil
@@ -231,6 +242,7 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 	if task.AttemptID != args.AttemptID {
 		log.Printf("stale report ignored: task %s-%d attempt %d (current %d) from worker %s",
 			args.TaskType, args.TaskID, args.AttemptID, task.AttemptID, args.WorkerID)
+		job.Metrics.StaleReports++
 		return nil
 	}
 
@@ -238,15 +250,22 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 		return nil
 	}
 
+	if task.State != InProgress || task.WorkerID != args.WorkerID || task.StartTime.IsZero() {
+		log.Printf("stale report ignored: task %s-%d attempt %d state=%s worker=%s report_worker=%s",
+			args.TaskType, args.TaskID, args.AttemptID, task.State, task.WorkerID, args.WorkerID)
+		job.Metrics.StaleReports++
+		return nil
+	}
+
 	if args.Success {
-		m.tm.CompleteTask(task, true, args.WorkerID)
+		m.tm.CompleteTask(task, true, args.WorkerID, args.Metrics)
 		if args.TaskType == MapTask {
 			for r := 0; r < job.Config.NReduce; r++ {
 				m.tm.MarkMapDoneForReduce(args.TaskID, r)
 			}
 		}
 	} else {
-		m.tm.CompleteTask(task, false, args.WorkerID)
+		m.tm.CompleteTask(task, false, args.WorkerID, args.Metrics)
 	}
 
 	return nil

@@ -96,6 +96,94 @@ type JobConfig struct {
 	ReduceSlowStart float64 // fraction of maps that must complete before reduce scheduling (0.0-1.0)
 }
 
+// TaskMetrics carries runtime counters from workers back to the master.
+type TaskMetrics struct {
+	InputBytes              int64
+	MapOutputRecords        int64
+	CombineOutputRecords    int64
+	ShuffleFiles            int64
+	ShuffleJSONBytes        int64
+	ShuffleBinaryBytes      int64
+	ShuffleCompressedBytes  int64
+	ShuffleWriteMs          int64
+	ShuffleWaitMs           int64
+	ReduceReadMs            int64
+	ReduceWriteMs           int64
+	ReduceStreamedRecords   int64
+	ReduceOutputKeys        int64
+	ReduceMaxBufferedValues int64
+	ReduceOpenedStreams     int64
+}
+
+// Add folds another metrics sample into the receiver.
+func (m *TaskMetrics) Add(other TaskMetrics) {
+	m.InputBytes += other.InputBytes
+	m.MapOutputRecords += other.MapOutputRecords
+	m.CombineOutputRecords += other.CombineOutputRecords
+	m.ShuffleFiles += other.ShuffleFiles
+	m.ShuffleJSONBytes += other.ShuffleJSONBytes
+	m.ShuffleBinaryBytes += other.ShuffleBinaryBytes
+	m.ShuffleCompressedBytes += other.ShuffleCompressedBytes
+	m.ShuffleWriteMs += other.ShuffleWriteMs
+	m.ShuffleWaitMs += other.ShuffleWaitMs
+	m.ReduceReadMs += other.ReduceReadMs
+	m.ReduceWriteMs += other.ReduceWriteMs
+	m.ReduceStreamedRecords += other.ReduceStreamedRecords
+	m.ReduceOutputKeys += other.ReduceOutputKeys
+	if other.ReduceMaxBufferedValues > m.ReduceMaxBufferedValues {
+		m.ReduceMaxBufferedValues = other.ReduceMaxBufferedValues
+	}
+	m.ReduceOpenedStreams += other.ReduceOpenedStreams
+}
+
+// JobMetrics aggregates optimization and reliability counters for one job.
+type JobMetrics struct {
+	InputBytes              int64
+	MapOutputRecords        int64
+	CombineOutputRecords    int64
+	ShuffleFiles            int64
+	ShuffleJSONBytes        int64
+	ShuffleBinaryBytes      int64
+	ShuffleCompressedBytes  int64
+	ShuffleWriteMs          int64
+	ReduceShuffleWaitMs     int64
+	ReduceReadMs            int64
+	ReduceWriteMs           int64
+	ReduceStreamedRecords   int64
+	ReduceOutputKeys        int64
+	ReduceMaxBufferedValues int64
+	ReduceOpenedStreams     int64
+	EarlyReduceStarts       int64
+	TaskFailures            int64
+	TaskTimeouts            int64
+	WorkerTimeouts          int64
+	BlacklistedWorkers      int64
+	SpeculativeRequeues     int64
+	StaleReports            int64
+	Retries                 int64
+}
+
+// AddTask folds a completed task sample into job-level metrics.
+func (m *JobMetrics) AddTask(sample TaskMetrics) {
+	m.InputBytes += sample.InputBytes
+	m.MapOutputRecords += sample.MapOutputRecords
+	m.CombineOutputRecords += sample.CombineOutputRecords
+	m.ShuffleFiles += sample.ShuffleFiles
+	m.ShuffleJSONBytes += sample.ShuffleJSONBytes
+	m.ShuffleBinaryBytes += sample.ShuffleBinaryBytes
+	m.ShuffleCompressedBytes += sample.ShuffleCompressedBytes
+	m.ShuffleWriteMs += sample.ShuffleWriteMs
+	m.ReduceShuffleWaitMs += sample.ShuffleWaitMs
+	m.ReduceReadMs += sample.ReduceReadMs
+	m.ReduceWriteMs += sample.ReduceWriteMs
+	m.ReduceStreamedRecords += sample.ReduceStreamedRecords
+	m.ReduceOutputKeys += sample.ReduceOutputKeys
+	if sample.ReduceMaxBufferedValues > m.ReduceMaxBufferedValues {
+		m.ReduceMaxBufferedValues = sample.ReduceMaxBufferedValues
+	}
+	m.ReduceOpenedStreams += sample.ReduceOpenedStreams
+}
+
 // Split describes one map input slice.
 type Split struct {
 	File   string
@@ -143,12 +231,16 @@ type Job struct {
 	CreatedAt        time.Time
 	CompletedAt      time.Time
 	Error            string
+	Metrics          JobMetrics
 }
 
 const (
 	DefaultTaskTimeout        = 10 * time.Second
+	DefaultLargeTaskTimeout   = 120 * time.Second
+	LargeTaskTimeoutThreshold = 8 * 1024 * 1024
 	DefaultWorkerTimeout      = 30 * time.Second
-	DefaultSplitSize          = 64 * 1024
+	DefaultSplitSize          = 32 * 1024 * 1024
+	DefaultMaxSplitScan       = 4 * 1024 * 1024
 	DefaultHeartbeat          = 5 * time.Second
 	DefaultReduceSlowStart    = 0.8
 	DefaultReduceTaskTimeout  = 120 * time.Second

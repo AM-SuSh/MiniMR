@@ -2,3 +2,19 @@
 .idea
 .cache
 .cursor
+.agents
+/mr-work-pd
+/mr-work
+/mr-bench-50m
+/mr-bench-64k
+/mr-bench-n5
+/mr-bench-shuffle
+/testdata
+
+# 编译产物（go build -o bin/...）
+/bin/
+*.exe
+
+# plugin 模式：插件源码与 .so 动态库
+/udf/plugins/
+*.so

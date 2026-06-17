@@ -139,6 +139,40 @@ func TestDistributedWordCount(t *testing.T) {
 	}
 }
 
+func TestWorkerWaitsAfterJobComplete(t *testing.T) {
+	master := mr.NewMaster(":0", ":0")
+	workDir := t.TempDir()
+	job, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     workDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, task := range job.MapTasks {
+		task.State = mr.Completed
+	}
+	for _, task := range job.ReduceTasks {
+		task.State = mr.Completed
+	}
+
+	var reply mr.RequestTaskReply
+	if err := master.RequestTask(&mr.RequestTaskArgs{WorkerID: "long-lived-worker"}, &reply); err != nil {
+		t.Fatal(err)
+	}
+	if reply.TaskType != mr.WaitTask {
+		t.Fatalf("expected WaitTask after job completion, got %s", reply.TaskType)
+	}
+	if job.State != mr.JobCompleted {
+		t.Fatalf("expected job to be marked completed, got %s", job.State)
+	}
+}
+
 func freePort(t *testing.T) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -291,6 +325,50 @@ func TestStaleAttemptRejection(t *testing.T) {
 
 	if task.State == mr.Completed {
 		t.Fatal("stale report should not have completed the task")
+	}
+}
+
+func TestTimedOutReportRejection(t *testing.T) {
+	master := mr.NewMaster(":0", ":0")
+	workDir := t.TempDir()
+	job, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     workDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var reply mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "slow-worker"}, &reply)
+	if reply.TaskType != mr.MapTask {
+		t.Fatalf("expected MapTask, got %v", reply.TaskType)
+	}
+
+	task := master.GetJob(job.ID).MapTasks[reply.TaskID]
+	task.State = mr.Idle
+	task.WorkerID = ""
+	task.StartTime = time.Time{}
+
+	var rr mr.ReportTaskReply
+	master.ReportTask(&mr.ReportTaskArgs{
+		WorkerID:  "slow-worker",
+		JobID:     job.ID,
+		TaskType:  mr.MapTask,
+		TaskID:    reply.TaskID,
+		AttemptID: reply.AttemptID,
+		Success:   true,
+	}, &rr)
+
+	if task.State == mr.Completed {
+		t.Fatal("timed-out report should not complete an idle task")
+	}
+	if master.GetJob(job.ID).Metrics.StaleReports == 0 {
+		t.Fatal("expected stale report metric to increment")
 	}
 }
 

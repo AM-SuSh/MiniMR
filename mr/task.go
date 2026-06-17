@@ -17,13 +17,17 @@ type TaskManager struct {
 	reduceTaskTimeout time.Duration
 	workerTimeout     time.Duration
 
-	completedMapTimes    []time.Duration
-	completedReduceTimes []time.Duration
-	decisions            []DecisionEvent
+	completedMapTimes     []time.Duration
+	completedReduceTimes  []time.Duration
+	decisions             []DecisionEvent
 	reduceSlowStartLogged bool
 }
 
 func NewTaskManager(job *Job) *TaskManager {
+	mapTimeout := DefaultTaskTimeout
+	if maxMapSplitLength(job) >= LargeTaskTimeoutThreshold {
+		mapTimeout = DefaultLargeTaskTimeout
+	}
 	reduceTimeout := DefaultTaskTimeout
 	if job.Config.ReduceSlowStart < 1.0 {
 		reduceTimeout = DefaultReduceTaskTimeout
@@ -31,7 +35,7 @@ func NewTaskManager(job *Job) *TaskManager {
 	return &TaskManager{
 		job:               job,
 		workers:           make(map[string]*WorkerInfo),
-		taskTimeout:       DefaultTaskTimeout,
+		taskTimeout:       mapTimeout,
 		reduceTaskTimeout: reduceTimeout,
 		workerTimeout:     DefaultWorkerTimeout,
 	}
@@ -81,11 +85,22 @@ func (tm *TaskManager) AssignTask(task *Task, workerID string) {
 		TaskID:    task.ID,
 		AttemptID: task.AttemptID,
 	})
+	if task.Type == ReduceTask && !allMapTasksCompleted(tm.job) {
+		tm.job.Metrics.EarlyReduceStarts++
+		tm.logDecision(DecisionEvent{
+			Type:      DecisionReduceSlowStart,
+			Message:   fmt.Sprintf("Reduce-%d 在 Map 尚未全部完成时提前启动 Shuffle", task.ID),
+			WorkerID:  workerID,
+			TaskType:  task.Type.String(),
+			TaskID:    task.ID,
+			AttemptID: task.AttemptID,
+		})
+	}
 }
 
 // CompleteTask marks a task as Completed or Failed, tracks worker reliability,
 // and records completion time for speculative execution decisions.
-func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string) {
+func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, metrics TaskMetrics) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -97,6 +112,7 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string) {
 			w.FailureCount++
 			if w.FailureCount >= DefaultMaxWorkerFailures && !w.Blacklisted {
 				w.Blacklisted = true
+				tm.job.Metrics.BlacklistedWorkers++
 				log.Printf("worker %s blacklisted after %d consecutive failures", w.ID, w.FailureCount)
 				tm.logDecision(DecisionEvent{
 					Type:     DecisionBlacklist,
@@ -110,6 +126,7 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string) {
 
 	if success {
 		task.State = Completed
+		tm.job.Metrics.AddTask(metrics)
 		elapsed := time.Since(task.StartTime)
 		if task.Type == MapTask {
 			tm.completedMapTimes = append(tm.completedMapTimes, elapsed)
@@ -126,6 +143,7 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string) {
 		})
 	} else {
 		task.State = Failed
+		tm.job.Metrics.TaskFailures++
 		tm.logDecision(DecisionEvent{
 			Type:      DecisionFail,
 			Message:   fmt.Sprintf("%s-%d 失败 (worker %s, attempt %d)", task.Type, task.ID, workerID, task.AttemptID),
@@ -177,7 +195,7 @@ func (tm *TaskManager) checkTimeouts() {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
-	if tm.job.State == JobFailed {
+	if tm.job.State == JobFailed || tm.job.State == JobCompleted {
 		return
 	}
 
@@ -188,6 +206,7 @@ func (tm *TaskManager) checkTimeouts() {
 		if !w.Blacklisted && now.Sub(w.LastHeartbeat) > tm.workerTimeout {
 			log.Printf("worker %s heartbeat timed out, resetting its tasks", w.ID)
 			tm.resetWorkerTasksLocked(w.ID)
+			tm.job.Metrics.WorkerTimeouts++
 			deadWorkers = append(deadWorkers, w.ID)
 		}
 	}
@@ -227,6 +246,8 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 
 		if elapsed > timeout {
 			task.RetryCount++
+			tm.job.Metrics.TaskTimeouts++
+			tm.job.Metrics.Retries++
 			log.Printf("task %s-%d hard timeout (attempt %d, retry %d/%d)",
 				task.Type, task.ID, task.AttemptID, task.RetryCount, DefaultMaxRetries)
 			tm.logDecision(DecisionEvent{
@@ -242,6 +263,7 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 					"task %s-%d exceeded max retries (%d)", task.Type, task.ID, DefaultMaxRetries))
 				return
 			}
+			tm.clearWorkerTaskLocked(task.WorkerID, task)
 			task.State = Idle
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
@@ -264,6 +286,8 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 					TaskID:    task.ID,
 					AttemptID: task.AttemptID,
 				})
+				tm.job.Metrics.SpeculativeRequeues++
+				tm.clearWorkerTaskLocked(task.WorkerID, task)
 				task.State = Idle
 				task.WorkerID = ""
 				task.StartTime = time.Time{}
@@ -272,6 +296,7 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 
 	case Failed:
 		task.RetryCount++
+		tm.job.Metrics.Retries++
 		log.Printf("task %s-%d failed (retry %d/%d)",
 			task.Type, task.ID, task.RetryCount, DefaultMaxRetries)
 		if task.RetryCount > DefaultMaxRetries {
@@ -336,6 +361,8 @@ func (tm *TaskManager) resetWorkerTasksLocked(workerID string) {
 	for _, task := range tm.job.MapTasks {
 		if task.WorkerID == workerID && task.State == InProgress {
 			task.RetryCount++
+			tm.job.Metrics.Retries++
+			tm.clearWorkerTaskLocked(workerID, task)
 			task.State = Idle
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
@@ -344,6 +371,8 @@ func (tm *TaskManager) resetWorkerTasksLocked(workerID string) {
 	for _, task := range tm.job.ReduceTasks {
 		if task.WorkerID == workerID && task.State == InProgress {
 			task.RetryCount++
+			tm.job.Metrics.Retries++
+			tm.clearWorkerTaskLocked(workerID, task)
 			task.State = Idle
 			task.WorkerID = ""
 			task.StartTime = time.Time{}
@@ -402,6 +431,31 @@ func (tm *TaskManager) CanScheduleReduce() bool {
 	return tm.canScheduleReduceLocked()
 }
 
+// CanLaunchEarlyReduce limits slow-start reducers so they do not occupy every
+// worker while there are still idle map tasks waiting.
+func (tm *TaskManager) CanLaunchEarlyReduce() bool {
+	tm.mu.Lock()
+	defer tm.mu.Unlock()
+	if allMapTasksCompleted(tm.job) {
+		return true
+	}
+	liveWorkers := tm.liveWorkerCountLocked(time.Now())
+	if liveWorkers < 2 {
+		return false
+	}
+	inProgressReduce := 0
+	for _, task := range tm.job.ReduceTasks {
+		if task.State == InProgress {
+			inProgressReduce++
+		}
+	}
+	limit := liveWorkers / 2
+	if limit < 1 {
+		limit = 1
+	}
+	return inProgressReduce < limit
+}
+
 // ---------------------------------------------------------------------------
 // Utilities
 // ---------------------------------------------------------------------------
@@ -418,4 +472,40 @@ func medianDuration(ds []time.Duration) time.Duration {
 		return (sorted[n/2-1] + sorted[n/2]) / 2
 	}
 	return sorted[n/2]
+}
+
+func allMapTasksCompleted(job *Job) bool {
+	for _, task := range job.MapTasks {
+		if task.State != Completed {
+			return false
+		}
+	}
+	return true
+}
+
+func (tm *TaskManager) liveWorkerCountLocked(now time.Time) int {
+	count := 0
+	for _, w := range tm.workers {
+		if !w.Blacklisted && now.Sub(w.LastHeartbeat) <= tm.workerTimeout {
+			count++
+		}
+	}
+	return count
+}
+
+func maxMapSplitLength(job *Job) int64 {
+	var maxLen int64
+	for _, task := range job.MapTasks {
+		if task.MapInfo != nil && task.MapInfo.Split.Length > maxLen {
+			maxLen = task.MapInfo.Split.Length
+		}
+	}
+	return maxLen
+}
+
+func (tm *TaskManager) clearWorkerTaskLocked(workerID string, task *Task) {
+	if w, ok := tm.workers[workerID]; ok && w.CurrentTask == task.ID && w.CurrentType == task.Type {
+		w.CurrentTask = -1
+		w.CurrentType = WaitTask
+	}
 }

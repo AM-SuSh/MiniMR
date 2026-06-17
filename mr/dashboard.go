@@ -39,25 +39,26 @@ type ReducePartitionStatus struct {
 
 // SchedulingInsight exposes parameters used for speculative execution.
 type SchedulingInsight struct {
-	MapMedianMs           int64   `json:"map_median_ms"`
-	ReduceMedianMs        int64   `json:"reduce_median_ms"`
-	SpeculativeMultiplier float64 `json:"speculative_multiplier"`
-	SpeculativeMinCompleted int   `json:"speculative_min_completed"`
-	MapCompletedSamples   int     `json:"map_completed_samples"`
-	ReduceCompletedSamples int    `json:"reduce_completed_samples"`
+	MapMedianMs             int64   `json:"map_median_ms"`
+	ReduceMedianMs          int64   `json:"reduce_median_ms"`
+	SpeculativeMultiplier   float64 `json:"speculative_multiplier"`
+	SpeculativeMinCompleted int     `json:"speculative_min_completed"`
+	MapCompletedSamples     int     `json:"map_completed_samples"`
+	ReduceCompletedSamples  int     `json:"reduce_completed_samples"`
 }
 
 // DashboardSnapshot is the full payload for GET /api/dashboard.
 type DashboardSnapshot struct {
-	Job               DashboardJob            `json:"job"`
-	Progress          DashboardProgress       `json:"progress"`
-	MapTasks          []DashboardTask         `json:"map_tasks"`
-	ReduceTasks       []DashboardTask         `json:"reduce_tasks"`
-	Workers           []DashboardWorker       `json:"workers"`
-	ReducePartitions  []ReducePartitionStatus `json:"reduce_partitions"`
-	Scheduling        SchedulingInsight       `json:"scheduling"`
-	Decisions         []DecisionEvent         `json:"decisions"`
-	ServerTime        time.Time               `json:"server_time"`
+	Job              DashboardJob            `json:"job"`
+	Progress         DashboardProgress       `json:"progress"`
+	MapTasks         []DashboardTask         `json:"map_tasks"`
+	ReduceTasks      []DashboardTask         `json:"reduce_tasks"`
+	Workers          []DashboardWorker       `json:"workers"`
+	ReducePartitions []ReducePartitionStatus `json:"reduce_partitions"`
+	Scheduling       SchedulingInsight       `json:"scheduling"`
+	Optimizations    OptimizationSnapshot    `json:"optimizations"`
+	Decisions        []DecisionEvent         `json:"decisions"`
+	ServerTime       time.Time               `json:"server_time"`
 }
 
 type DashboardJob struct {
@@ -82,13 +83,63 @@ type DashboardConf struct {
 }
 
 type DashboardProgress struct {
-	MapCompleted              int     `json:"map_completed"`
-	MapTotal                  int     `json:"map_total"`
-	ReduceCompleted           int     `json:"reduce_completed"`
-	ReduceTotal               int     `json:"reduce_total"`
-	MapRatio                  float64 `json:"map_ratio"`
-	ReduceSlowStartThreshold  float64 `json:"reduce_slow_start_threshold"`
-	ReduceSchedulingUnlocked  bool    `json:"reduce_scheduling_unlocked"`
+	MapCompleted             int     `json:"map_completed"`
+	MapTotal                 int     `json:"map_total"`
+	ReduceCompleted          int     `json:"reduce_completed"`
+	ReduceTotal              int     `json:"reduce_total"`
+	MapRatio                 float64 `json:"map_ratio"`
+	ReduceSlowStartThreshold float64 `json:"reduce_slow_start_threshold"`
+	ReduceSchedulingUnlocked bool    `json:"reduce_scheduling_unlocked"`
+}
+
+type OptimizationSnapshot struct {
+	SlowStart      SlowStartEffect      `json:"slow_start"`
+	Shuffle        ShuffleEffect        `json:"shuffle"`
+	Streaming      StreamingEffect      `json:"streaming"`
+	FaultTolerance FaultToleranceEffect `json:"fault_tolerance"`
+}
+
+type SlowStartEffect struct {
+	Enabled           bool    `json:"enabled"`
+	Threshold         float64 `json:"threshold"`
+	MapRatio          float64 `json:"map_ratio"`
+	Unlocked          bool    `json:"unlocked"`
+	EarlyReduceStarts int64   `json:"early_reduce_starts"`
+	ActiveReduces     int     `json:"active_reduces"`
+}
+
+type ShuffleEffect struct {
+	Records             int64   `json:"records"`
+	Files               int64   `json:"files"`
+	JSONBytes           int64   `json:"json_bytes"`
+	BinaryBytes         int64   `json:"binary_bytes"`
+	CompressedBytes     int64   `json:"compressed_bytes"`
+	BinarySavedPercent  float64 `json:"binary_saved_percent"`
+	CompressedSavedPct  float64 `json:"compressed_saved_percent"`
+	CompressedToJSONPct float64 `json:"compressed_to_json_percent"`
+	WriteMs             int64   `json:"write_ms"`
+}
+
+type StreamingEffect struct {
+	StreamedRecords   int64 `json:"streamed_records"`
+	OutputKeys        int64 `json:"output_keys"`
+	OpenedStreams     int64 `json:"opened_streams"`
+	MaxBufferedValues int64 `json:"max_buffered_values"`
+	ShuffleWaitMs     int64 `json:"shuffle_wait_ms"`
+	StreamMs          int64 `json:"stream_ms"`
+	WriteMs           int64 `json:"write_ms"`
+}
+
+type FaultToleranceEffect struct {
+	WorkersTotal        int   `json:"workers_total"`
+	WorkersAlive        int   `json:"workers_alive"`
+	BlacklistedWorkers  int64 `json:"blacklisted_workers"`
+	TaskFailures        int64 `json:"task_failures"`
+	TaskTimeouts        int64 `json:"task_timeouts"`
+	WorkerTimeouts      int64 `json:"worker_timeouts"`
+	SpeculativeRequeues int64 `json:"speculative_requeues"`
+	StaleReports        int64 `json:"stale_reports"`
+	Retries             int64 `json:"retries"`
 }
 
 // BuildDashboardSnapshot assembles UI state for the given job.
@@ -123,6 +174,7 @@ func (m *Master) snapshotWithoutTM(job *Job, now time.Time) DashboardSnapshot {
 	snap.MapTasks = tasksToDashboard(job.MapTasks, nil, now)
 	snap.ReduceTasks = tasksToDashboard(job.ReduceTasks, nil, now)
 	snap.ReducePartitions = partitionStatus(job)
+	snap.Optimizations = optimizationSnapshot(job, snap.Progress, nil)
 	return snap
 }
 
@@ -151,6 +203,7 @@ func (m *Master) snapshotWithTM(job *Job, tm *TaskManager, now time.Time) Dashbo
 	snap.ReduceTasks = tasksToDashboard(job.ReduceTasks, &taskInsight{reduceMedian, len(tm.completedReduceTimes)}, now)
 	snap.Workers = workersToDashboard(tm.workers, now, tm.workerTimeout)
 	snap.ReducePartitions = partitionStatus(job)
+	snap.Optimizations = optimizationSnapshot(job, snap.Progress, snap.Workers)
 	snap.Decisions = make([]DecisionEvent, len(tm.decisions))
 	copy(snap.Decisions, tm.decisions)
 
@@ -206,8 +259,8 @@ func progressFromCounts(job *Job, mapDone, mapTotal, reduceDone, reduceTotal int
 }
 
 type taskInsight struct {
-	median          time.Duration
-	completedCount  int
+	median         time.Duration
+	completedCount int
 }
 
 func tasksToDashboard(tasks []*Task, insight *taskInsight, now time.Time) []DashboardTask {
@@ -301,4 +354,75 @@ func (tm *TaskManager) canScheduleReduceLocked() bool {
 		threshold = 1.0
 	}
 	return float64(completedMaps)/float64(totalMaps) >= threshold
+}
+
+func optimizationSnapshot(job *Job, progress DashboardProgress, workers []DashboardWorker) OptimizationSnapshot {
+	m := job.Metrics
+	activeReduces := 0
+	for _, task := range job.ReduceTasks {
+		if task.State == InProgress {
+			activeReduces++
+		}
+	}
+	aliveWorkers := 0
+	for _, worker := range workers {
+		if worker.Alive {
+			aliveWorkers++
+		}
+	}
+	return OptimizationSnapshot{
+		SlowStart: SlowStartEffect{
+			Enabled:           job.Config.ReduceSlowStart < 1.0,
+			Threshold:         progress.ReduceSlowStartThreshold,
+			MapRatio:          progress.MapRatio,
+			Unlocked:          progress.ReduceSchedulingUnlocked,
+			EarlyReduceStarts: m.EarlyReduceStarts,
+			ActiveReduces:     activeReduces,
+		},
+		Shuffle: ShuffleEffect{
+			Records:             m.CombineOutputRecords,
+			Files:               m.ShuffleFiles,
+			JSONBytes:           m.ShuffleJSONBytes,
+			BinaryBytes:         m.ShuffleBinaryBytes,
+			CompressedBytes:     m.ShuffleCompressedBytes,
+			BinarySavedPercent:  savedPercent(m.ShuffleJSONBytes, m.ShuffleBinaryBytes),
+			CompressedSavedPct:  savedPercent(m.ShuffleJSONBytes, m.ShuffleCompressedBytes),
+			CompressedToJSONPct: ratioPercent(m.ShuffleCompressedBytes, m.ShuffleJSONBytes),
+			WriteMs:             m.ShuffleWriteMs,
+		},
+		Streaming: StreamingEffect{
+			StreamedRecords:   m.ReduceStreamedRecords,
+			OutputKeys:        m.ReduceOutputKeys,
+			OpenedStreams:     m.ReduceOpenedStreams,
+			MaxBufferedValues: m.ReduceMaxBufferedValues,
+			ShuffleWaitMs:     m.ReduceShuffleWaitMs,
+			StreamMs:          m.ReduceReadMs,
+			WriteMs:           m.ReduceWriteMs,
+		},
+		FaultTolerance: FaultToleranceEffect{
+			WorkersTotal:        len(workers),
+			WorkersAlive:        aliveWorkers,
+			BlacklistedWorkers:  m.BlacklistedWorkers,
+			TaskFailures:        m.TaskFailures,
+			TaskTimeouts:        m.TaskTimeouts,
+			WorkerTimeouts:      m.WorkerTimeouts,
+			SpeculativeRequeues: m.SpeculativeRequeues,
+			StaleReports:        m.StaleReports,
+			Retries:             m.Retries,
+		},
+	}
+}
+
+func savedPercent(before, after int64) float64 {
+	if before <= 0 {
+		return 0
+	}
+	return (1 - float64(after)/float64(before)) * 100
+}
+
+func ratioPercent(part, total int64) float64 {
+	if total <= 0 {
+		return 0
+	}
+	return float64(part) / float64(total) * 100
 }

@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css" />
+  <link rel="stylesheet" href="styles.css?v=optimizations" />
 </head>
 <body>
   <header class="top-nav">
@@ -119,6 +119,56 @@
           </div>
         </section>
 
+        <!-- 优化效果 -->
+        <section class="bento-optimizations optimization-band">
+          <header class="band-header">
+            <div>
+              <p class="label">优化观测</p>
+              <h2>pd.train 运行证据</h2>
+            </div>
+            <span class="band-chip">实时累计</span>
+          </header>
+          <div class="optimization-grid">
+            <article class="optimization-panel opt-slow">
+              <div class="opt-top">
+                <span class="opt-kicker">Reduce Slow Start</span>
+                <span id="opt-slow-status" class="opt-status">等待</span>
+              </div>
+              <div class="opt-metric" id="opt-slow-metric">0%</div>
+              <div class="opt-bar"><div id="opt-slow-bar" class="opt-fill"></div></div>
+              <p id="opt-slow-detail" class="opt-detail">等待 Map 完成率达到阈值</p>
+            </article>
+            <article class="optimization-panel opt-shuffle">
+              <div class="opt-top">
+                <span class="opt-kicker">Shuffle Compression</span>
+                <span id="opt-shuffle-records" class="opt-status">0 rec</span>
+              </div>
+              <div class="opt-metric" id="opt-shuffle-saved">0%</div>
+              <div class="opt-compare">
+                <span id="opt-shuffle-before">JSONL —</span>
+                <span id="opt-shuffle-after">gzip —</span>
+              </div>
+              <div class="opt-bar"><div id="opt-shuffle-bar" class="opt-fill"></div></div>
+            </article>
+            <article class="optimization-panel opt-stream">
+              <div class="opt-top">
+                <span class="opt-kicker">Streaming Reduce</span>
+                <span id="opt-stream-buffer" class="opt-status">buffer 0</span>
+              </div>
+              <div class="opt-metric" id="opt-stream-records">0 rec</div>
+              <p id="opt-stream-detail" class="opt-detail">按 key 流式归并，避免全量载入中间数据</p>
+            </article>
+            <article class="optimization-panel opt-fault">
+              <div class="opt-top">
+                <span class="opt-kicker">Fault Tolerance</span>
+                <span id="opt-fault-status" class="opt-status">检查中</span>
+              </div>
+              <div class="opt-metric" id="opt-fault-checks">0</div>
+              <p id="opt-fault-detail" class="opt-detail">心跳、超时重试、黑名单与陈旧 attempt 检查</p>
+            </article>
+          </div>
+        </section>
+
         <!-- Map / Reduce -->
         <section class="bento-map card">
           <header class="card-header"><div><p class="label">分片计算</p><h2>Map 任务</h2></div></header>
@@ -180,6 +230,6 @@
     <span>MiniMR Dashboard</span>
   </footer>
 
-  <script src="app.js"></script>
+  <script src="app.js?v=optimizations"></script>
 </body>
 </html>

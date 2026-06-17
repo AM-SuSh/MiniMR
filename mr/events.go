@@ -6,17 +6,17 @@ import "time"
 type DecisionType string
 
 const (
-	DecisionAssign           DecisionType = "assign"
-	DecisionComplete         DecisionType = "complete"
-	DecisionFail             DecisionType = "fail"
-	DecisionSpeculative      DecisionType = "speculative"
-	DecisionTimeout          DecisionType = "timeout"
-	DecisionWorkerTimeout    DecisionType = "worker_timeout"
-	DecisionBlacklist        DecisionType = "blacklist"
-	DecisionReduceSlowStart  DecisionType = "reduce_slow_start"
-	DecisionReduceReady      DecisionType = "reduce_ready"
-	DecisionJobFailed        DecisionType = "job_failed"
-	DecisionJobCompleted     DecisionType = "job_completed"
+	DecisionAssign          DecisionType = "assign"
+	DecisionComplete        DecisionType = "complete"
+	DecisionFail            DecisionType = "fail"
+	DecisionSpeculative     DecisionType = "speculative"
+	DecisionTimeout         DecisionType = "timeout"
+	DecisionWorkerTimeout   DecisionType = "worker_timeout"
+	DecisionBlacklist       DecisionType = "blacklist"
+	DecisionReduceSlowStart DecisionType = "reduce_slow_start"
+	DecisionReduceReady     DecisionType = "reduce_ready"
+	DecisionJobFailed       DecisionType = "job_failed"
+	DecisionJobCompleted    DecisionType = "job_completed"
 )
 
 // DecisionEvent is one schedulable action or inference surfaced to the UI.

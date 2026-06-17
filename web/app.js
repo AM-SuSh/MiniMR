@@ -29,6 +29,21 @@
     reduceProgressText: $("reduce-progress-text"),
     slowstartStatus: $("slowstart-status"),
     slowstartDetail: $("slowstart-detail"),
+    optSlowStatus: $("opt-slow-status"),
+    optSlowMetric: $("opt-slow-metric"),
+    optSlowBar: $("opt-slow-bar"),
+    optSlowDetail: $("opt-slow-detail"),
+    optShuffleRecords: $("opt-shuffle-records"),
+    optShuffleSaved: $("opt-shuffle-saved"),
+    optShuffleBefore: $("opt-shuffle-before"),
+    optShuffleAfter: $("opt-shuffle-after"),
+    optShuffleBar: $("opt-shuffle-bar"),
+    optStreamBuffer: $("opt-stream-buffer"),
+    optStreamRecords: $("opt-stream-records"),
+    optStreamDetail: $("opt-stream-detail"),
+    optFaultStatus: $("opt-fault-status"),
+    optFaultChecks: $("opt-fault-checks"),
+    optFaultDetail: $("opt-fault-detail"),
     jobConfig: $("job-config"),
     schedulingInsight: $("scheduling-insight"),
     workersGrid: $("workers-grid"),
@@ -86,8 +101,33 @@
   }
 
   function formatMs(ms) {
+    if (ms == null) return "—";
     if (ms < 1000) return `${ms}ms`;
     return `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  function formatBytes(bytes) {
+    if (!bytes) return "—";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let n = Number(bytes);
+    let i = 0;
+    while (n >= 1024 && i < units.length - 1) {
+      n /= 1024;
+      i++;
+    }
+    return `${n >= 10 || i === 0 ? n.toFixed(0) : n.toFixed(1)} ${units[i]}`;
+  }
+
+  function formatCount(n) {
+    n = Number(n || 0);
+    if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+    if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+    return String(n);
+  }
+
+  function formatPercent(n) {
+    if (!Number.isFinite(Number(n))) return "0%";
+    return `${Number(n).toFixed(1)}%`;
   }
 
   function setLiveState(state) {
@@ -127,6 +167,21 @@
       <span class="task-state">${task.state.replace("_", " ")}</span>
       <span class="task-detail">${escapeHtml(details.join(" · ") || "—")}</span>
     </div>`;
+  }
+
+  function renderTaskGrid(el, tasks) {
+    const maxVisible = 240;
+    const list = tasks || [];
+    const visible = list.slice(0, maxVisible);
+    const overflow = list.length - visible.length;
+    const overflowCell = overflow > 0
+      ? `<div class="task-overflow">
+          <span class="task-id">+${overflow}</span>
+          <span class="task-state">hidden</span>
+          <span class="task-detail">大文件任务已汇总，避免前端渲染阻塞</span>
+        </div>`
+      : "";
+    el.innerHTML = visible.map(renderTaskCell).join("") + overflowCell;
   }
 
   function renderWorker(w) {
@@ -207,6 +262,45 @@
     els.pipeReduceConn?.classList.toggle("flowing", running && unlocked && reducePct < 100);
   }
 
+  function renderOptimizations(data, prog) {
+    const opt = data.optimizations || {};
+    const slow = opt.slow_start || {};
+    const shuffle = opt.shuffle || {};
+    const streaming = opt.streaming || {};
+    const fault = opt.fault_tolerance || {};
+
+    const mapRatio = Math.round((slow.map_ratio ?? prog.map_ratio ?? 0) * 100);
+    const threshold = Math.round((slow.threshold ?? prog.reduce_slow_start_threshold ?? 0.8) * 100);
+    const early = Number(slow.early_reduce_starts || 0);
+    els.optSlowStatus.textContent = early > 0 ? "已提前" : slow.unlocked ? "已解锁" : "等待";
+    els.optSlowMetric.textContent = `${mapRatio}% / ${threshold}%`;
+    els.optSlowBar.style.width = `${Math.min(100, mapRatio)}%`;
+    els.optSlowDetail.textContent = early > 0
+      ? `提前启动 ${early} 个 Reduce · 活跃 ${slow.active_reduces || 0}`
+      : `阈值 ${threshold}% · ${slow.enabled ? "慢启动开启" : "全量 Map 后启动"}`;
+
+    const saved = Number(shuffle.compressed_saved_percent || 0);
+    els.optShuffleSaved.textContent = shuffle.json_bytes ? `节省 ${formatPercent(saved)}` : "收集中";
+    els.optShuffleRecords.textContent = `${formatCount(shuffle.records)} rec`;
+    els.optShuffleBefore.textContent = `JSONL ${formatBytes(shuffle.json_bytes)}`;
+    els.optShuffleAfter.textContent = `gzip ${formatBytes(shuffle.compressed_bytes)}`;
+    els.optShuffleBar.style.width = `${Math.max(0, Math.min(100, saved))}%`;
+
+    els.optStreamRecords.textContent = `${formatCount(streaming.streamed_records)} rec`;
+    els.optStreamBuffer.textContent = `buffer ${formatCount(streaming.max_buffered_values)}`;
+    els.optStreamDetail.textContent = `${formatCount(streaming.output_keys)} keys · ${formatCount(streaming.opened_streams)} streams · ${formatMs(streaming.stream_ms || 0)} merge`;
+
+    const issueCount =
+      Number(fault.task_failures || 0) +
+      Number(fault.task_timeouts || 0) +
+      Number(fault.worker_timeouts || 0) +
+      Number(fault.blacklisted_workers || 0) +
+      Number(fault.stale_reports || 0);
+    els.optFaultStatus.textContent = issueCount > 0 ? "已介入" : (fault.workers_total > 0 ? "健康" : "待心跳");
+    els.optFaultChecks.textContent = `${formatCount(fault.workers_alive || 0)} / ${formatCount(fault.workers_total || 0)}`;
+    els.optFaultDetail.textContent = `重试 ${fault.retries || 0} · 超时 ${fault.task_timeouts || 0} · 黑名单 ${fault.blacklisted_workers || 0} · 陈旧上报 ${fault.stale_reports || 0}`;
+  }
+
   function render(data) {
     if (!data.job || !data.job.id) {
       els.emptyState.classList.remove("hidden");
@@ -239,6 +333,7 @@
 
     prog.reduce_partitions_ready = (data.reduce_partitions || []).filter((p) => p.ready).length;
     updatePipeline(job, prog);
+    renderOptimizations(data, prog);
 
     const cfg = job.config || {};
     renderConfig(els.jobConfig, [
@@ -248,7 +343,7 @@
       ["Map 函数", cfg.map_func || "—"],
       ["Reduce", cfg.reduce_func || "—"],
       ["Combine", cfg.combine_func || "—"],
-      ["分片", cfg.split_size ? `${cfg.split_size} B` : "64 KB"],
+      ["分片", cfg.split_size ? formatBytes(cfg.split_size) : "32 MB"],
       ["目录", cfg.work_dir],
       ["Slow Start", cfg.reduce_slow_start],
     ]);
@@ -271,8 +366,8 @@
     els.workersEmpty.classList.toggle("hidden", workers.length > 0);
     els.workersGrid.innerHTML = workers.map(renderWorker).join("");
 
-    els.mapTasks.innerHTML = (data.map_tasks || []).map(renderTaskCell).join("");
-    els.reduceTasks.innerHTML = (data.reduce_tasks || []).map(renderTaskCell).join("");
+    renderTaskGrid(els.mapTasks, data.map_tasks || []);
+    renderTaskGrid(els.reduceTasks, data.reduce_tasks || []);
     els.partitionGrid.innerHTML = (data.reduce_partitions || []).map(renderPartition).join("");
 
     const decisions = [...(data.decisions || [])].reverse();

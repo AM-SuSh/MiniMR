@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"io"
 	"os"
-	"unicode/utf8"
 )
 
 // SplitInput splits input files into map tasks at line boundaries.
@@ -38,31 +37,37 @@ func SplitInput(files []string, splitSize int64) ([]Split, error) {
 			}
 
 			if offset+length < info.Size() {
-				// Advance to next line boundary without breaking UTF-8 runes.
+				// Advance to the next line boundary. If a line is extremely long,
+				// stop scanning after DefaultMaxSplitScan and only extend far
+				// enough to avoid cutting a UTF-8 rune in half.
 				if _, err := f.Seek(offset+length, io.SeekStart); err != nil {
 					f.Close()
 					return nil, err
 				}
 				reader := bufio.NewReader(f)
 				extra := int64(0)
+				foundLine := false
 				for {
+					if extra >= DefaultMaxSplitScan {
+						break
+					}
 					b, err := reader.ReadByte()
 					if err != nil {
 						break
 					}
 					extra++
 					if b == '\n' {
+						foundLine = true
 						break
 					}
-					// If we're mid-rune, keep reading until rune completes.
-					for !utf8.FullRune([]byte{b}) {
-						nb, err := reader.ReadByte()
-						if err != nil {
-							break
-						}
-						extra++
-						b = nb
+				}
+				if !foundLine && extra >= DefaultMaxSplitScan {
+					utf8Extra, err := utf8BoundaryExtra(f, offset+length+extra, info.Size())
+					if err != nil {
+						f.Close()
+						return nil, err
 					}
+					extra += utf8Extra
 				}
 				length += extra
 				if offset+length > info.Size() {
@@ -84,4 +89,27 @@ func SplitInput(files []string, splitSize int64) ([]Split, error) {
 		return []Split{}, nil
 	}
 	return splits, nil
+}
+
+func utf8BoundaryExtra(f *os.File, pos, size int64) (int64, error) {
+	if pos >= size {
+		return 0, nil
+	}
+	if _, err := f.Seek(pos, io.SeekStart); err != nil {
+		return 0, err
+	}
+	buf := make([]byte, 4)
+	n, err := f.Read(buf)
+	if err != nil && err != io.EOF {
+		return 0, err
+	}
+	extra := int64(0)
+	for extra < int64(n) && isUTF8Continuation(buf[extra]) {
+		extra++
+	}
+	return extra, nil
+}
+
+func isUTF8Continuation(b byte) bool {
+	return b&0xC0 == 0x80
 }

@@ -31,6 +31,7 @@ type ReportTaskArgs struct {
 	TaskID    int
 	AttemptID int // must match the current attempt; stale reports are ignored
 	Success   bool
+	Metrics   TaskMetrics
 }
 
 // ReportTaskReply acknowledges a task report.
