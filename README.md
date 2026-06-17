@@ -1,148 +1,4 @@
-# MiniMR — Go 分布式 MapReduce 框架
-
-## 快速开始
-
-### 单机模式（向后兼容）
-
-```bash
-go run . -input testdata/input.txt -output mr-out-standalone
-```
-
-### 分布式模式
-
-**Windows 原生或 WSL 均可编译运行：**
-
-```bash
-# 终端 1 — 启动 Master
-go run ./cmd/master -port :8080 -http :8081
-
-# 终端 2 — 启动 Worker（可启动多个）
-go run ./cmd/worker -master localhost:8080 -id worker-1
-
-# 终端 3 — 提交任务
-go run ./cmd/client \
-  -master-http http://localhost:8081 \
-  -input testdata/input.txt \
-  -nreduce 3
-```
-
-### WSL 一键演示
-
-```bash
-wsl bash scripts/run_wordcount.sh
-```
-
-## 目录结构
-
-| 路径 | 说明 |
-|------|------|
-| `mr/` | 核心框架：Master、Worker、RPC、分片、任务状态机 |
-| `udf/` | UDF 注册表与实现（WordCount、爬虫清洗） |
-| `cmd/master` | Master 进程入口 |
-| `cmd/worker` | Worker 进程入口 |
-| `cmd/client` | CLI 任务提交客户端 |
-| `bridge/` | Python HTTP 桥接脚本 |
-| `scripts/` | 运行与测试脚本 |
-| `logs/` | 每个 Job 的调度决策持久化日志（`{job_id}.log`） |
-| `testdata/` | 测试数据 |
-| `main.go` | 单机模式入口 |
-
-## Job ID 与作业历史
-
-Master 在收到 `POST /api/job` 时为每次提交自动生成 **Job ID**（16 位十六进制，例如 `b836a9a97b403684`）。同一 Master 进程内：
-
-- 所有作业保留在内存索引中，**不会**因新任务提交而删除旧记录
-- 仪表盘 **Job ID** 输入框为空时，跟随当前最新作业；填入 ID 或点击「历史作业」可回溯查看
-- 每个 Job 的调度事件追加写入 `logs/{job_id}.log`（JSON Lines，含 `start` / `decision` / `finish`）
-- 作业结束时冻结参与过的 **Worker 快照**，历史作业仪表盘可查看当时 Worker 状态（非实时心跳）
-
-常用 API：
-
-```bash
-# 提交任务，响应含 job_id
-curl -X POST http://localhost:8081/api/job -H "Content-Type: application/json" -d '{"input_files":["testdata/input.txt"],"n_reduce":3,"map_func":"wordcount_map","reduce_func":"wordcount_reduce","combine_func":"wordcount_combine"}'
-
-# 查看指定作业仪表盘
-curl "http://localhost:8081/api/dashboard?job=<job_id>"
-
-# 查看持久化调度日志
-type logs\<job_id>.log    # Windows
-tail -f logs/<job_id>.log # Linux/WSL
-```
-
-## UDF
-
-| 名称 | Map | Reduce | Combine |
-|------|-----|--------|---------|
-| WordCount | `wordcount_map` | `wordcount_reduce` | `wordcount_combine` |
-| 爬虫清洗 | `crawl_clean_map` | `crawl_clean_reduce` | — |
-
-新增 UDF：在 `udf/` 下实现函数并在 `registry.go` 的 `init()` 中注册。
-
-## Python 集成
-
-```bash
-pip install requests
-python bridge/submit_job.py --input testdata/input.txt
-```
-
-## Plugin 模式（仅 Linux/WSL）
-
-```bash
-GOOS=linux go build -buildmode=plugin -o wordcount_mapper.so udf/plugins/wordcount_mapper.go
-GOOS=linux go build -buildmode=plugin -o wordcount_reducer.so udf/plugins/wordcount_reducer.go
-```
-
-## 测试
-
-```bash
-go test ./... -v -count=1
-```
-
-## 测试
-
-```bash
-# Master
-go run ./cmd/master -port :8080 -http :8081
-
-# Worker
-go run ./cmd/worker -master localhost:8080 -id worker-1
-
-# Client
-go run ./cmd/client `
-  -master-http http://localhost:8081 `
-  -input testdata/pd.train.part1 `
-  -split 67108864 `
-  -nreduce 3 `
-  -map wordcount_map `
-  -reduce wordcount_reduce `
-  -combine wordcount_combine `
-  -workdir mr-work-pd `
-  -slowstart 0.6
-```
-
-
-
-## 优化特性
-
-- **Reduce 提前调度**：某 reduce 分区所有 Map 输出就绪即可开始 Reduce
-- **Combine**：Map 端本地预聚合，减少 Shuffle 数据量
-- **Shuffle 优化**：
-  
-  - 二进制编码
-  
-  - gzip压缩
-  
-       ```
-       go run ./cmd/shuffle_bench -nreduce 5
-       ```
-  
-  - Map 端按 key 排序写入，Reduce 端归并
-  
-  - gzip压缩
-- **容错**：任务超时重分配、Worker 心跳检测、中间文件原子写入
-
-
+# MiniMR — 基于 Go 的轻量级分布式 MapReduce 框架
 
 ## 一、项目简介
 
@@ -287,7 +143,11 @@ Windows PowerShell 下可将 `bin/master` 换为 `bin\master.exe` 等。
 go run . -input testdata/input.txt -output mr-out-standalone -nreduce 3
 ```
 
-输出文件：`mr-out-standalone-0`、`mr-out-standalone-1`、…
+python集成：
+
+```
+python bridge/submit_job.py --input testdata/input.txt
+```
 
 ### 4.4 分布式部署
 
@@ -302,7 +162,7 @@ go run ./cmd/master -port :8080 -http :8081
 
 启动后访问 Dashboard：**http://localhost:8081/**
 
-**终端 2 — Worker（可开多个）**
+**终端 2 — Worker**
 
 ```bash
 go run ./cmd/worker -master localhost:8080 -id worker-1
@@ -324,16 +184,42 @@ go run ./cmd/client \
 
 ```bash
 # 仅启动 Master
-wsl bash scripts/run_master.sh
+bash scripts/run_master.sh
 
 # 启动 N 个 Worker（默认 3 个）
-wsl bash scripts/run_workers.sh 3 localhost:8080
+bash scripts/run_workers.sh 3 localhost:8080
 
 # WordCount 完整演示（编译 + Master + Worker + Client）
-wsl bash scripts/run_wordcount.sh
+bash scripts/run_wordcount.sh
 ```
 
-### 4.6 测试
+### 4.6 Plugin测试
+
+```bash
+export CGO_ENABLED=1
+go build -buildmode=plugin -o wordcount_mapper.so ./udf/plugins/wordcount_mapper.go
+go build -buildmode=plugin -o wordcount_reducer.so ./udf/plugins/wordcount_reducer.go
+```
+
+```bash
+# 终端 1 — Master
+go run ./cmd/master -port :8080 -http :8081
+
+# 终端 2 — Worker（加载 plugin）
+go run ./cmd/worker -master localhost:8080 -id worker-1 \
+  -plugin wordcount_mapper.so -plugin-name wordcount
+
+# 终端 3 — 提交任务
+go run ./cmd/client \
+  -master-http http://localhost:8081 \
+  -input testdata/input.txt \
+  -nreduce 3 \
+  -map wordcount_map \
+  -reduce wordcount_reduce \
+  -combine wordcount_combine
+```
+
+### 4.7 测试
 
 ```bash
 # Master
@@ -437,16 +323,6 @@ python bridge/submit_job.py --master http://localhost:8081 --input testdata/inpu
 2. 在 `udf/registry.go` 的 `init()` 中注册名称。
 3. Worker 启动时通过 `_ "mapreduce/udf"` 自动加载。
 4. 提交作业时在 `-map` / `-reduce` / `-combine` 或 API JSON 中指定函数名。
-
-### 5.6 Plugin 模式（仅 Linux / WSL）
-
-```bash
-GOOS=linux go build -buildmode=plugin -o wordcount_mapper.so udf/plugins/wordcount_mapper.go
-GOOS=linux go build -buildmode=plugin -o wordcount_reducer.so udf/plugins/wordcount_reducer.go
-
-./bin/worker -master localhost:8080 -id worker-1 \
-  -plugin wordcount_mapper.so -plugin-name wordcount
-```
 
 ## 六、HTTP API 一览
 
