@@ -55,6 +55,7 @@ func (tm *TaskManager) RegisterWorker(id string) {
 		LastHeartbeat: time.Now(),
 		CurrentTask:   -1,
 	}
+	tm.job.snapshotWorkersLocked(tm.workers, time.Now(), tm.workerTimeout)
 }
 
 func (tm *TaskManager) Heartbeat(workerID string) {
@@ -77,6 +78,7 @@ func (tm *TaskManager) AssignTask(task *Task, workerID string) {
 		w.CurrentTask = task.ID
 		w.CurrentType = task.Type
 	}
+	tm.job.snapshotWorkersLocked(tm.workers, time.Now(), tm.workerTimeout)
 	tm.logDecision(DecisionEvent{
 		Type:      DecisionAssign,
 		Message:   fmt.Sprintf("分配 %s-%d → %s (attempt %d)", task.Type, task.ID, workerID, task.AttemptID),
@@ -153,6 +155,7 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, m
 			AttemptID: task.AttemptID,
 		})
 	}
+	tm.job.snapshotWorkersLocked(tm.workers, time.Now(), tm.workerTimeout)
 }
 
 func (tm *TaskManager) ResetTask(task *Task) {
@@ -187,6 +190,12 @@ func (tm *TaskManager) StartMonitor(done <-chan struct{}) {
 			return
 		case <-ticker.C:
 			tm.checkTimeouts()
+			tm.mu.Lock()
+			finished := tm.job.State == JobFailed || tm.job.State == JobCompleted
+			tm.mu.Unlock()
+			if finished {
+				return
+			}
 		}
 	}
 }
@@ -322,6 +331,8 @@ func (tm *TaskManager) failJobLocked(reason string) {
 		Type:    DecisionJobFailed,
 		Message: reason,
 	})
+	tm.job.snapshotWorkersLocked(tm.workers, tm.job.CompletedAt, tm.workerTimeout)
+	tm.job.closeJobLog()
 }
 
 func (tm *TaskManager) maybeLogReduceSlowStartLocked() {

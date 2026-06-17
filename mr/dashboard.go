@@ -1,6 +1,9 @@
 package mr
 
-import "time"
+import (
+	"sort"
+	"time"
+)
 
 // DashboardTask is a task row for the web UI.
 type DashboardTask struct {
@@ -50,6 +53,7 @@ type SchedulingInsight struct {
 // DashboardSnapshot is the full payload for GET /api/dashboard.
 type DashboardSnapshot struct {
 	Job              DashboardJob            `json:"job"`
+	JobHistory       []DashboardJobSummary   `json:"job_history"`
 	Progress         DashboardProgress       `json:"progress"`
 	MapTasks         []DashboardTask         `json:"map_tasks"`
 	ReduceTasks      []DashboardTask         `json:"reduce_tasks"`
@@ -59,6 +63,23 @@ type DashboardSnapshot struct {
 	Optimizations    OptimizationSnapshot    `json:"optimizations"`
 	Decisions        []DecisionEvent         `json:"decisions"`
 	ServerTime       time.Time               `json:"server_time"`
+}
+
+type DashboardJobSummary struct {
+	ID              string     `json:"id"`
+	State           string     `json:"state"`
+	CreatedAt       time.Time  `json:"created_at"`
+	CompletedAt     *time.Time `json:"completed_at,omitempty"`
+	InputFiles      []string   `json:"input_files"`
+	NMap            int        `json:"n_map"`
+	NReduce         int        `json:"n_reduce"`
+	WorkDir         string     `json:"work_dir"`
+	MapCompleted    int        `json:"map_completed"`
+	MapTotal        int        `json:"map_total"`
+	ReduceCompleted int        `json:"reduce_completed"`
+	ReduceTotal     int        `json:"reduce_total"`
+	IsCurrent       bool       `json:"is_current"`
+	IsSelected      bool       `json:"is_selected"`
 }
 
 type DashboardJob struct {
@@ -147,21 +168,22 @@ func (m *Master) BuildDashboardSnapshot(job *Job) DashboardSnapshot {
 	now := time.Now()
 	snap := DashboardSnapshot{ServerTime: now}
 
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
 	if job == nil {
+		snap.JobHistory = m.jobHistoryLocked(nil, now)
 		return snap
 	}
 
-	m.mu.Lock()
-	defer m.mu.Unlock()
+	m.completeJobIfDoneLocked(job, now)
 
 	if m.tm != nil && job == m.current {
 		snap = m.snapshotWithTM(job, m.tm, now)
 	} else {
 		snap = m.snapshotWithoutTM(job, now)
 	}
-	if m.allTasksCompleteLocked(job) && job.State != JobFailed {
-		job.State = JobCompleted
-	}
+	snap.JobHistory = m.jobHistoryLocked(job, now)
 
 	return snap
 }
@@ -174,7 +196,9 @@ func (m *Master) snapshotWithoutTM(job *Job, now time.Time) DashboardSnapshot {
 	snap.MapTasks = tasksToDashboard(job.MapTasks, nil, now)
 	snap.ReduceTasks = tasksToDashboard(job.ReduceTasks, nil, now)
 	snap.ReducePartitions = partitionStatus(job)
-	snap.Optimizations = optimizationSnapshot(job, snap.Progress, nil)
+	snap.Optimizations = optimizationSnapshot(job, snap.Progress, job.WorkerSnapshot)
+	snap.Workers = copyDashboardWorkers(job.WorkerSnapshot)
+	snap.Decisions = copyDecisions(job.Decisions)
 	return snap
 }
 
@@ -204,10 +228,91 @@ func (m *Master) snapshotWithTM(job *Job, tm *TaskManager, now time.Time) Dashbo
 	snap.Workers = workersToDashboard(tm.workers, now, tm.workerTimeout)
 	snap.ReducePartitions = partitionStatus(job)
 	snap.Optimizations = optimizationSnapshot(job, snap.Progress, snap.Workers)
-	snap.Decisions = make([]DecisionEvent, len(tm.decisions))
-	copy(snap.Decisions, tm.decisions)
+	snap.Decisions = copyDecisions(tm.decisions)
 
 	return snap
+}
+
+func (m *Master) jobHistoryLocked(selected *Job, now time.Time) []DashboardJobSummary {
+	out := make([]DashboardJobSummary, 0, len(m.jobs))
+	for _, job := range m.jobs {
+		mapDone, mapTotal, reduceDone, reduceTotal := m.jobProgressCountsLocked(job, now)
+		row := DashboardJobSummary{
+			ID:              job.ID,
+			State:           job.State.String(),
+			CreatedAt:       job.CreatedAt,
+			InputFiles:      job.Config.InputFiles,
+			NMap:            job.Config.NMap,
+			NReduce:         job.Config.NReduce,
+			WorkDir:         job.Config.WorkDir,
+			MapCompleted:    mapDone,
+			MapTotal:        mapTotal,
+			ReduceCompleted: reduceDone,
+			ReduceTotal:     reduceTotal,
+			IsCurrent:       job == m.current,
+			IsSelected:      selected != nil && job.ID == selected.ID,
+		}
+		if !job.CompletedAt.IsZero() {
+			t := job.CompletedAt
+			row.CompletedAt = &t
+		}
+		out = append(out, row)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
+			return out[i].ID > out[j].ID
+		}
+		return out[i].CreatedAt.After(out[j].CreatedAt)
+	})
+	return out
+}
+
+func (m *Master) jobProgressCountsLocked(job *Job, now time.Time) (mapDone, mapTotal, reduceDone, reduceTotal int) {
+	if job == m.current && m.tm != nil {
+		m.tm.mu.Lock()
+		defer m.tm.mu.Unlock()
+		if m.allTasksCompleteLocked(job) && job.State != JobFailed {
+			m.completeJobLocked(job, now)
+		}
+		mapDone, mapTotal = countCompleted(job.MapTasks)
+		reduceDone, reduceTotal = countCompleted(job.ReduceTasks)
+		return
+	}
+	if m.allTasksCompleteLocked(job) && job.State != JobFailed {
+		m.completeJobLocked(job, now)
+	}
+	mapDone, mapTotal = countCompleted(job.MapTasks)
+	reduceDone, reduceTotal = countCompleted(job.ReduceTasks)
+	return
+}
+
+func (m *Master) completeJobIfDoneLocked(job *Job, now time.Time) {
+	if job == m.current && m.tm != nil {
+		m.tm.mu.Lock()
+		defer m.tm.mu.Unlock()
+		if m.allTasksCompleteLocked(job) && job.State != JobFailed {
+			m.completeJobLocked(job, now)
+		}
+		return
+	}
+	if m.allTasksCompleteLocked(job) && job.State != JobFailed {
+		m.completeJobLocked(job, now)
+	}
+}
+
+func copyDecisions(in []DecisionEvent) []DecisionEvent {
+	out := make([]DecisionEvent, len(in))
+	copy(out, in)
+	return out
+}
+
+func copyDashboardWorkers(in []DashboardWorker) []DashboardWorker {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([]DashboardWorker, len(in))
+	copy(out, in)
+	return out
 }
 
 func baseJobSnapshot(job *Job, now time.Time) DashboardSnapshot {

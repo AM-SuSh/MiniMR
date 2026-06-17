@@ -1,6 +1,7 @@
 package main_test
 
 import (
+	"errors"
 	"fmt"
 	"net"
 	"net/rpc"
@@ -173,6 +174,133 @@ func TestWorkerWaitsAfterJobComplete(t *testing.T) {
 	}
 }
 
+func TestStartJobRejectsWhileCurrentRunning(t *testing.T) {
+	master := mr.NewMaster(":0", ":0")
+	_, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     t.TempDir(),
+	})
+	if !errors.Is(err, mr.ErrJobAlreadyRunning) {
+		t.Fatalf("expected ErrJobAlreadyRunning, got %v", err)
+	}
+}
+
+func TestJobHistoryKeepsCompletedJobs(t *testing.T) {
+	logDir := t.TempDir()
+	oldLogDir := mr.JobLogDir
+	mr.JobLogDir = logDir
+	t.Cleanup(func() { mr.JobLogDir = oldLogDir })
+
+	master := mr.NewMaster(":0", ":0")
+	first, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply mr.RequestTaskReply
+	if err := master.RequestTask(&mr.RequestTaskArgs{WorkerID: "worker-1"}, &reply); err != nil {
+		t.Fatal(err)
+	}
+	master.CompleteJobForTest(first)
+
+	second, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if master.GetJob(first.ID) == nil {
+		t.Fatal("completed first job should remain addressable by Job ID")
+	}
+
+	oldSnap := master.BuildDashboardSnapshot(first)
+	if oldSnap.Job.ID != first.ID {
+		t.Fatalf("expected old snapshot for %s, got %s", first.ID, oldSnap.Job.ID)
+	}
+
+	currentSnap := master.BuildDashboardSnapshot(second)
+	seen := map[string]bool{}
+	for _, item := range currentSnap.JobHistory {
+		seen[item.ID] = true
+	}
+	if !seen[first.ID] || !seen[second.ID] {
+		t.Fatalf("history should contain both jobs, got %#v", currentSnap.JobHistory)
+	}
+
+	if len(oldSnap.Workers) == 0 {
+		t.Fatal("historical job should retain worker snapshot")
+	}
+	if _, err := os.Stat(mr.JobLogPath(first.ID)); err != nil {
+		t.Fatalf("expected persisted job log: %v", err)
+	}
+
+	master.CompleteJobForTest(second)
+}
+
+func TestJobLogRecordsDecisions(t *testing.T) {
+	logDir := t.TempDir()
+	oldLogDir := mr.JobLogDir
+	mr.JobLogDir = logDir
+	t.Cleanup(func() { mr.JobLogDir = oldLogDir })
+
+	master := mr.NewMaster(":0", ":0")
+	job, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var reply mr.RequestTaskReply
+	if err := master.RequestTask(&mr.RequestTaskArgs{WorkerID: "worker-a"}, &reply); err != nil {
+		t.Fatal(err)
+	}
+	master.CompleteJobForTest(job)
+
+	data, err := os.ReadFile(mr.JobLogPath(job.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	for _, want := range []string{`"kind":"start"`, `"kind":"decision"`, `"kind":"finish"`, `"worker-a"`} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("log missing %q:\n%s", want, text)
+		}
+	}
+}
+
 func freePort(t *testing.T) string {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -196,6 +324,15 @@ func allComplete(job *mr.Job) bool {
 		}
 	}
 	return true
+}
+
+func completeTasks(job *mr.Job) {
+	for _, task := range job.MapTasks {
+		task.State = mr.Completed
+	}
+	for _, task := range job.ReduceTasks {
+		task.State = mr.Completed
+	}
 }
 
 func readOutputCounts(t *testing.T, workDir string, nReduce int) map[string]int {

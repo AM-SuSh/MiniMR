@@ -11,7 +11,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="styles.css?v=optimizations" />
+  <link rel="stylesheet" href="styles.css?v=history" />
 </head>
 <body>
   <header class="top-nav">
@@ -32,10 +32,11 @@
         </div>
         <div class="conn-field conn-field--short">
           <label for="job-id">Job ID</label>
-          <input id="job-id" type="text" placeholder="当前作业" autocomplete="off" />
+          <input id="job-id" type="text" placeholder="空=最新" autocomplete="off" />
         </div>
         <div class="conn-actions">
           <button id="btn-connect" class="btn btn-primary" type="button">连接</button>
+          <button id="btn-latest" class="btn btn-ghost" type="button" title="清空 Job ID 并查看最新作业">最新</button>
           <button id="btn-pause" class="btn btn-ghost" type="button" aria-pressed="false">暂停</button>
         </div>
         <div class="live-indicator" id="live-indicator" title="轮询状态">
@@ -189,6 +190,17 @@
           <p id="workers-empty" class="empty-inline hidden">还没有 Worker — 运行 <code>go run ./cmd/worker</code></p>
         </section>
 
+        <!-- 作业历史 -->
+        <section class="bento-history card">
+          <header class="card-header">
+            <div><p class="label">Job ID 索引</p><h2>历史作业</h2></div>
+            <span class="count-badge" id="history-count">0</span>
+          </header>
+          <p class="job-id-note">Master 自动分配 16 位十六进制 Job ID；输入框为空时跟随最新作业。调度日志持久化至 <code>logs/{job_id}.log</code>。</p>
+          <div id="job-history" class="job-history-list"></div>
+          <p id="job-history-empty" class="empty-inline hidden">暂无历史作业</p>
+        </section>
+
         <!-- 决策日志（右侧实时流，macOS 终端风格） -->
         <section class="bento-decisions terminal card--log" id="decisions-card">
           <div class="terminal-bar">
@@ -230,6 +242,6 @@
     <span>MiniMR Dashboard</span>
   </footer>
 
-  <script src="app.js?v=optimizations"></script>
+  <script src="app.js?v=history"></script>
 </body>
 </html>

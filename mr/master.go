@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -21,10 +22,13 @@ type Master struct {
 	jobs     map[string]*Job //JobID-Job
 	current  *Job            //当前正在执行的作业（简化版只执行单作业，即同一时间Master只处理一个作业）
 	tm       *TaskManager    //任务管理器：跟踪任务分配、超时、重试
+	starting bool            // true while StartJob is preparing splits for the next active job
 	rpcAddr  string
 	httpAddr string
 	done     chan struct{} //关闭信号，用于停止服务。
 }
+
+var ErrJobAlreadyRunning = errors.New("job already running")
 
 // NewMaster creates a Master instance.
 func NewMaster(rpcAddr, httpAddr string) *Master {
@@ -57,15 +61,37 @@ func (m *Master) StartJob(config JobConfig) (*Job, error) {
 		config.ReduceSlowStart = DefaultReduceSlowStart
 	}
 
+	m.mu.Lock()
+	if err := m.canStartJobLocked(time.Now()); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.starting = true
+	m.mu.Unlock()
+
+	reserved := true
+	releaseReservation := func() {
+		if !reserved {
+			return
+		}
+		m.mu.Lock()
+		m.starting = false
+		m.mu.Unlock()
+		reserved = false
+	}
+
 	if err := os.MkdirAll(config.WorkDir, 0755); err != nil {
+		releaseReservation()
 		return nil, err
 	}
 
 	splits, err := SplitInput(config.InputFiles, config.SplitSize)
 	if err != nil {
+		releaseReservation()
 		return nil, err
 	}
 	if len(splits) == 0 {
+		releaseReservation()
 		return nil, fmt.Errorf("no input splits from files: %v", config.InputFiles)
 	}
 
@@ -101,14 +127,70 @@ func (m *Master) StartJob(config JobConfig) (*Job, error) {
 		})
 	}
 
+	tm := NewTaskManager(job)
+	jobLog, err := openJobLog(job)
+	if err != nil {
+		releaseReservation()
+		return nil, fmt.Errorf("open job log: %w", err)
+	}
+	job.jobLog = jobLog
+
 	m.mu.Lock()
 	m.jobs[jobID] = job
 	m.current = job
-	m.tm = NewTaskManager(job)
+	m.tm = tm
+	m.starting = false
 	m.mu.Unlock()
+	reserved = false
 
-	go m.tm.StartMonitor(m.done)
+	go tm.StartMonitor(m.done)
 	return job, nil
+}
+
+func (m *Master) canStartJobLocked(now time.Time) error {
+	if m.starting {
+		return fmt.Errorf("%w: another job is being prepared", ErrJobAlreadyRunning)
+	}
+	if m.current == nil || m.current.State == JobCompleted || m.current.State == JobFailed {
+		return nil
+	}
+	if m.tm != nil {
+		m.tm.mu.Lock()
+		defer m.tm.mu.Unlock()
+	}
+	if m.allTasksCompleteLocked(m.current) {
+		m.completeJobLocked(m.current, now)
+		return nil
+	}
+	return fmt.Errorf("%w: current job %s is still running", ErrJobAlreadyRunning, m.current.ID)
+}
+
+func (m *Master) completeJobLocked(job *Job, completedAt time.Time) {
+	if job == nil || job.State == JobFailed {
+		return
+	}
+	if job.State == JobCompleted && job.jobLog == nil {
+		return
+	}
+	if job.State != JobCompleted {
+		job.State = JobCompleted
+		if job.CompletedAt.IsZero() {
+			job.CompletedAt = completedAt
+		}
+	}
+	m.finalizeJobLocked(job, completedAt)
+}
+
+func (m *Master) finalizeJobLocked(job *Job, at time.Time) {
+	if job == m.current && m.tm != nil {
+		m.tm.mu.Lock()
+		job.snapshotWorkersLocked(m.tm.workers, at, m.tm.workerTimeout)
+		m.tm.mu.Unlock()
+	}
+	if job.State == JobCompleted {
+		LogJobCompletedDecision(job, at)
+	}
+	job.closeJobLog()
 }
 
 // RequestTask assigns the next available task to a Worker.
@@ -170,8 +252,7 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 
 	if m.allTasksCompleteLocked(job) {
 		reply.TaskType = WaitTask
-		job.State = JobCompleted
-		job.CompletedAt = time.Now()
+		m.completeJobLocked(job, time.Now())
 		return nil
 	}
 
@@ -266,6 +347,9 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 		}
 	} else {
 		m.tm.CompleteTask(task, false, args.WorkerID, args.Metrics)
+	}
+	if m.allTasksCompleteLocked(job) {
+		m.completeJobLocked(job, time.Now())
 	}
 
 	return nil
@@ -364,7 +448,11 @@ func (m *Master) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		ReduceSlowStart: req.ReduceSlowStart,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrJobAlreadyRunning) {
+			status = http.StatusConflict
+		}
+		http.Error(w, err.Error(), status)
 		return
 	}
 
@@ -396,15 +484,12 @@ func (m *Master) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 	jobID := r.URL.Query().Get("job")
 	m.mu.Lock()
-	job, ok := m.jobs[jobID]
-	if !ok {
-		job = m.current
-	}
+	job := m.lookupJobLocked(jobID)
 	m.mu.Unlock()
 
 	if job == nil {
 		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(DashboardSnapshot{ServerTime: time.Now()})
+		_ = json.NewEncoder(w).Encode(m.BuildDashboardSnapshot(nil))
 		return
 	}
 
@@ -416,10 +501,7 @@ func (m *Master) handleDashboard(w http.ResponseWriter, r *http.Request) {
 func (m *Master) handleStatus(w http.ResponseWriter, r *http.Request) {
 	jobID := r.URL.Query().Get("job")
 	m.mu.Lock()
-	job, ok := m.jobs[jobID]
-	if !ok {
-		job = m.current
-	}
+	job := m.lookupJobLocked(jobID)
 	m.mu.Unlock()
 
 	if job == nil {
@@ -432,7 +514,7 @@ func (m *Master) handleStatus(w http.ResponseWriter, r *http.Request) {
 	reduceDone, reduceTotal := countCompleted(job.ReduceTasks)
 	state := job.State.String()
 	if m.allTasksCompleteLocked(job) {
-		job.State = JobCompleted
+		m.completeJobLocked(job, time.Now())
 		state = JobCompleted.String()
 	} else if mapDone < mapTotal || reduceDone < reduceTotal {
 		job.State = JobRunning
@@ -464,10 +546,7 @@ func countCompleted(tasks []*Task) (done, total int) {
 func (m *Master) handleResult(w http.ResponseWriter, r *http.Request) {
 	jobID := r.URL.Query().Get("job")
 	m.mu.Lock()
-	job, ok := m.jobs[jobID]
-	if !ok {
-		job = m.current
-	}
+	job := m.lookupJobLocked(jobID)
 	m.mu.Unlock()
 
 	if job == nil {
@@ -489,11 +568,33 @@ func (m *Master) handleResult(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (m *Master) lookupJobLocked(jobID string) *Job {
+	if jobID == "" {
+		return m.current
+	}
+	return m.jobs[jobID]
+}
+
 // GetJob returns a job by ID (for testing).
 func (m *Master) GetJob(id string) *Job {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.jobs[id]
+}
+
+// CompleteJobForTest marks all tasks completed and finalizes worker snapshots/logs.
+func (m *Master) CompleteJobForTest(job *Job) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, t := range job.MapTasks {
+		t.State = Completed
+	}
+	for _, t := range job.ReduceTasks {
+		t.State = Completed
+	}
+	job.State = JobCompleted
+	job.CompletedAt = time.Now()
+	m.finalizeJobLocked(job, job.CompletedAt)
 }
 
 // GetCurrentJob returns the active job (for testing).

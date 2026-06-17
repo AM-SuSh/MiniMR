@@ -9,6 +9,7 @@
     masterUrl: $("master-url"),
     jobId: $("job-id"),
     btnConnect: $("btn-connect"),
+    btnLatest: $("btn-latest"),
     btnPause: $("btn-pause"),
     btnTheme: $("btn-theme"),
     emptyState: $("empty-state"),
@@ -49,6 +50,9 @@
     workersGrid: $("workers-grid"),
     workersEmpty: $("workers-empty"),
     workerCount: $("worker-count"),
+    historyCount: $("history-count"),
+    jobHistory: $("job-history"),
+    jobHistoryEmpty: $("job-history-empty"),
     mapTasks: $("map-tasks"),
     reduceTasks: $("reduce-tasks"),
     partitionGrid: $("partition-grid"),
@@ -63,6 +67,8 @@
   let polling = false;
   let paused = false;
   let timer = null;
+  let decisionsJobId = "";
+  let decisionsFingerprint = "";
 
   const stateLabels = {
     running: "作业运行中",
@@ -128,6 +134,15 @@
   function formatPercent(n) {
     if (!Number.isFinite(Number(n))) return "0%";
     return `${Number(n).toFixed(1)}%`;
+  }
+
+  function shortJobID(id) {
+    if (!id) return "—";
+    return id.length > 10 ? `${id.slice(0, 8)}…` : id;
+  }
+
+  function progressRatio(done, total) {
+    return total ? Math.round((done / total) * 100) : 0;
   }
 
   function setLiveState(state) {
@@ -224,11 +239,90 @@
   function renderDecision(d) {
     const t = d.time ? formatTime(d.time) : "—";
     const type = (d.type || "unknown").replace(/\./g, "_");
+    const isBanner = d.type === "job_completed" || d.type === "job_failed";
+    if (isBanner) {
+      return `<div class="decision-row decision-banner decision-type-${type}">
+        <span class="decision-time">${t}</span>
+        <span class="decision-type ${type}">${escapeHtml(d.type || "")}</span>
+        <span class="decision-msg">${escapeHtml(d.message || "")}</span>
+      </div>`;
+    }
     return `<div class="decision-row decision-type-${type}">
       <span class="decision-time">${t}</span>
       <span class="decision-type ${type}">${escapeHtml(d.type || "")}</span>
       <span class="decision-msg">${escapeHtml(d.message || "")}</span>
     </div>`;
+  }
+
+  function decisionFingerprint(list) {
+    return list
+      .map((d) => `${d.time}|${d.type}|${d.message}|${d.task_id}|${d.attempt_id}`)
+      .join("\n");
+  }
+
+  function decisionsForDisplay(decisions, job) {
+    const list = [...(decisions || [])];
+    if (job.state === "completed" && !list.some((d) => d.type === "job_completed")) {
+      list.push({
+        type: "job_completed",
+        time: job.completed_at || null,
+        message: `════ 作业完成 ════ Job ${job.id}`,
+      });
+    } else if (job.state === "failed" && !list.some((d) => d.type === "job_failed") && job.error) {
+      list.push({
+        type: "job_failed",
+        time: job.completed_at || null,
+        message: job.error,
+      });
+    }
+    return list;
+  }
+
+  function renderDecisionsLog(decisions, job) {
+    const logEl = els.decisionsLog;
+    if (!logEl) return;
+
+    const list = decisionsForDisplay(decisions, job);
+    const fp = decisionFingerprint(list);
+    const jobSwitched = job.id !== decisionsJobId;
+
+    if (jobSwitched) {
+      decisionsJobId = job.id;
+      decisionsFingerprint = "";
+    }
+
+    if (fp === decisionsFingerprint) {
+      return;
+    }
+
+    const prevScrollTop = logEl.scrollTop;
+    const prevHeight = logEl.scrollHeight;
+    const clientHeight = logEl.clientHeight;
+    const wasPinnedBottom = prevHeight - clientHeight - prevScrollTop < 48;
+    const isRunning = job.state === "running";
+
+    decisionsFingerprint = fp;
+
+    const hasDecisions = list.length > 0;
+    if (els.decisionsCard) {
+      els.decisionsCard.classList.toggle("card--log-filled", hasDecisions);
+    }
+    if (els.decisionsEmpty) {
+      els.decisionsEmpty.classList.toggle("hidden", hasDecisions);
+    }
+    if (els.decisionsCount) {
+      els.decisionsCount.textContent = String(list.length);
+    }
+
+    logEl.innerHTML = list.map(renderDecision).join("");
+
+    if (jobSwitched) {
+      logEl.scrollTop = logEl.scrollHeight;
+    } else if (!paused && isRunning && wasPinnedBottom) {
+      logEl.scrollTop = logEl.scrollHeight;
+    } else if (prevHeight > 0) {
+      logEl.scrollTop = prevScrollTop + (logEl.scrollHeight - prevHeight);
+    }
   }
 
   function updatePipeline(job, prog) {
@@ -260,6 +354,40 @@
 
     els.pipeShuffleConn?.classList.toggle("flowing", running && unlocked && mapPct < 100);
     els.pipeReduceConn?.classList.toggle("flowing", running && unlocked && reducePct < 100);
+  }
+
+  function renderHistoryItem(job) {
+    const mapPct = progressRatio(job.map_completed, job.map_total);
+    const reducePct = progressRatio(job.reduce_completed, job.reduce_total);
+    const classes = ["job-history-item", job.state || "unknown"];
+    if (job.is_selected) classes.push("selected");
+    if (job.is_current) classes.push("current");
+    const input = (job.input_files || []).map((p) => p.split(/[\\/]/).pop()).join(", ") || "—";
+    const time = job.completed_at || job.created_at;
+    return `<button class="${classes.join(" ")}" type="button" data-job-id="${escapeHtml(job.id)}" title="${escapeHtml(job.id)}">
+      <span class="history-id">${escapeHtml(shortJobID(job.id))}</span>
+      <span class="history-state">${escapeHtml(job.state || "unknown")}${job.is_current ? " · current" : ""}</span>
+      <span class="history-input">${escapeHtml(input)}</span>
+      <span class="history-progress">
+        <span>Map ${job.map_completed ?? 0}/${job.map_total ?? 0}</span>
+        <span>Reduce ${job.reduce_completed ?? 0}/${job.reduce_total ?? 0}</span>
+      </span>
+      <span class="history-bars" aria-hidden="true">
+        <i style="width:${mapPct}%"></i>
+        <b style="width:${reducePct}%"></b>
+      </span>
+      <span class="history-time">${formatDateTime(time)}</span>
+    </button>`;
+  }
+
+  function renderJobHistory(history) {
+    const list = history || [];
+    if (els.historyCount) {
+      els.historyCount.textContent = String(list.length);
+    }
+    if (!els.jobHistory || !els.jobHistoryEmpty) return;
+    els.jobHistoryEmpty.classList.toggle("hidden", list.length > 0);
+    els.jobHistory.innerHTML = list.map(renderHistoryItem).join("");
   }
 
   function renderOptimizations(data, prog) {
@@ -302,6 +430,8 @@
   }
 
   function render(data) {
+    renderJobHistory(data.job_history || []);
+
     if (!data.job || !data.job.id) {
       els.emptyState.classList.remove("hidden");
       els.dashboard.classList.add("hidden");
@@ -370,15 +500,8 @@
     renderTaskGrid(els.reduceTasks, data.reduce_tasks || []);
     els.partitionGrid.innerHTML = (data.reduce_partitions || []).map(renderPartition).join("");
 
-    const decisions = [...(data.decisions || [])].reverse();
-    const hasDecisions = decisions.length > 0;
-    if (els.decisionsCard) {
-      els.decisionsCard.classList.toggle("card--log-filled", hasDecisions);
-    }
-    if (els.decisionsCount) {
-      els.decisionsCount.textContent = String(decisions.length);
-    }
-    els.decisionsLog.innerHTML = decisions.map(renderDecision).join("");
+    const decisions = data.decisions || [];
+    renderDecisionsLog(decisions, job);
 
     els.lastUpdate.textContent = `更新 ${formatDateTime(data.server_time)}`;
     if (!paused) {
@@ -425,6 +548,20 @@
   }
 
   els.btnConnect.addEventListener("click", () => {
+    stopPolling();
+    startPolling();
+  });
+
+  els.btnLatest?.addEventListener("click", () => {
+    els.jobId.value = "";
+    stopPolling();
+    startPolling();
+  });
+
+  els.jobHistory?.addEventListener("click", (event) => {
+    const item = event.target.closest("[data-job-id]");
+    if (!item) return;
+    els.jobId.value = item.dataset.jobId || "";
     stopPolling();
     startPolling();
   });

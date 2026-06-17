@@ -3,6 +3,8 @@
 .cache
 .cursor
 .agents
+
+# 数据目录
 /mr-work-pd
 /mr-work
 /mr-bench-50m
@@ -11,7 +13,8 @@
 /mr-bench-shuffle
 /testdata
 
-# 编译产物（go build -o bin/...）
+# 调度日志（运行时生成）
+/logs/
 /bin/
 *.exe
 

@@ -232,6 +232,9 @@ type Job struct {
 	CompletedAt      time.Time
 	Error            string
 	Metrics          JobMetrics
+	Decisions        []DecisionEvent
+	WorkerSnapshot   []DashboardWorker // frozen at job finish for historical dashboard
+	jobLog           *jobLogWriter
 }
 
 const (

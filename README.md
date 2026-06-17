@@ -58,8 +58,32 @@ wsl bash scripts/run_crawl_clean.sh
 | `cmd/client` | CLI 任务提交客户端 |
 | `bridge/` | Python HTTP 桥接脚本 |
 | `scripts/` | 运行与测试脚本 |
+| `logs/` | 每个 Job 的调度决策持久化日志（`{job_id}.log`） |
 | `testdata/` | 测试数据 |
 | `main.go` | 单机模式入口 |
+
+## Job ID 与作业历史
+
+Master 在收到 `POST /api/job` 时为每次提交自动生成 **Job ID**（16 位十六进制，例如 `b836a9a97b403684`）。同一 Master 进程内：
+
+- 所有作业保留在内存索引中，**不会**因新任务提交而删除旧记录
+- 仪表盘 **Job ID** 输入框为空时，跟随当前最新作业；填入 ID 或点击「历史作业」可回溯查看
+- 每个 Job 的调度事件追加写入 `logs/{job_id}.log`（JSON Lines，含 `start` / `decision` / `finish`）
+- 作业结束时冻结参与过的 **Worker 快照**，历史作业仪表盘可查看当时 Worker 状态（非实时心跳）
+
+常用 API：
+
+```bash
+# 提交任务，响应含 job_id
+curl -X POST http://localhost:8081/api/job -H "Content-Type: application/json" -d '{"input_files":["testdata/input.txt"],"n_reduce":3,"map_func":"wordcount_map","reduce_func":"wordcount_reduce","combine_func":"wordcount_combine"}'
+
+# 查看指定作业仪表盘
+curl "http://localhost:8081/api/dashboard?job=<job_id>"
+
+# 查看持久化调度日志
+type logs\<job_id>.log    # Windows
+tail -f logs/<job_id>.log # Linux/WSL
+```
 
 ## UDF
 
