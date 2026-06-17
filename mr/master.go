@@ -54,7 +54,7 @@ func (m *Master) StartJob(config JobConfig) (*Job, error) {
 	if config.NReduce <= 0 {
 		config.NReduce = 3
 	}
-	if config.NMap <= 0 && config.SplitSize <= 0 {
+	if config.SplitSize <= 0 {
 		config.SplitSize = DefaultSplitSize
 	}
 	if config.ReduceSlowStart <= 0 || config.ReduceSlowStart > 1.0 {
@@ -85,7 +85,7 @@ func (m *Master) StartJob(config JobConfig) (*Job, error) {
 		return nil, err
 	}
 
-	splits, err := PrepareSplits(config.InputFiles, config.SplitSize, config.NMap)
+	splits, err := SplitInput(config.InputFiles, config.SplitSize)
 	if err != nil {
 		releaseReservation()
 		return nil, err
@@ -411,7 +411,6 @@ func (m *Master) Shutdown() {
 
 type submitJobRequest struct {
 	InputFiles      []string `json:"input_files"`
-	NMap            int      `json:"n_map"`
 	NReduce         int      `json:"n_reduce"`
 	MapFunc         string   `json:"map_func"`
 	ReduceFunc      string   `json:"reduce_func"`
@@ -440,7 +439,6 @@ func (m *Master) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 
 	job, err := m.StartJob(JobConfig{
 		InputFiles:      req.InputFiles,
-		NMap:            req.NMap,
 		NReduce:         req.NReduce,
 		MapFunc:         req.MapFunc,
 		ReduceFunc:      req.ReduceFunc,

@@ -14,12 +14,11 @@ import (
 func main() {
 	masterHTTP := flag.String("master-http", "http://localhost:8081", "Master HTTP address")
 	inputFiles := flag.String("input", "", "Comma-separated input files")
-	nMap := flag.Int("nmap", 0, "Number of map tasks (0 = auto from split size)")
 	nReduce := flag.Int("nreduce", 3, "Number of reduce tasks")
 	mapFunc := flag.String("map", "wordcount_map", "Map function name")
 	reduceFunc := flag.String("reduce", "wordcount_reduce", "Reduce function name")
 	combineFunc := flag.String("combine", "wordcount_combine", "Combine function name")
-	splitSize := flag.Int64("split", 0, "Map split size in bytes (0 = default 32 MiB, ignored when -nmap > 0)")
+	splitSize := flag.Int64("split", 0, "Split size in bytes (0 = default)")
 	workDir := flag.String("workdir", "mr-work", "Working directory")
 	slowStart := flag.Float64("slowstart", 0, "Reduce slow start threshold (0 = default 0.8)")
 	flag.Parse()
@@ -31,7 +30,6 @@ func main() {
 	files := splitCSV(*inputFiles)
 	jobID, err := submitJob(*masterHTTP, map[string]interface{}{
 		"input_files":       files,
-		"n_map":             *nMap,
 		"n_reduce":          *nReduce,
 		"map_func":          *mapFunc,
 		"reduce_func":       *reduceFunc,

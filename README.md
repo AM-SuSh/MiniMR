@@ -128,13 +128,12 @@ go run ./cmd/worker -master localhost:8080 -id worker-1
 go run ./cmd/client `
   -master-http http://localhost:8081 `
   -input testdata/pd.train.part1 `
-  -nmap 4`
+  -split 67108864 `
   -nreduce 3 `
   -map wordcount_map `
   -reduce wordcount_reduce `
   -combine wordcount_combine `
   -workdir mr-work-pd `
-  -split 67108864 `
   -slowstart 0.6
 ```
 

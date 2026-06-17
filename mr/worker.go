@@ -239,7 +239,7 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics) {
 		if int64(len(curVals)) > metrics.ReduceMaxBufferedValues {
 			metrics.ReduceMaxBufferedValues = int64(len(curVals))
 		}
-
+		// 从同源流补一条回堆 —— 补
 		if kv, ok := readers[item.streamID].Next(); ok {
 			heap.Push(mh, mergeItem{kv: kv, streamID: item.streamID})
 		}
