@@ -22,7 +22,12 @@
     pipeMapPct: $("pipe-map-pct"),
     pipeMapBar: $("pipe-map-bar"),
     pipeShuffleLabel: $("pipe-shuffle-label"),
+    pipeShuffleHint: $("pipe-shuffle-hint"),
     pipeShuffleConn: $("pipe-shuffle-conn"),
+    reduceShuffleSummary: $("reduce-shuffle-summary"),
+    reduceShuffleCount: $("reduce-shuffle-count"),
+    reduceShuffleGrid: $("reduce-shuffle-grid"),
+    reduceShuffleEmpty: $("reduce-shuffle-empty"),
     pipeReducePct: $("pipe-reduce-pct"),
     pipeReduceBar: $("pipe-reduce-bar"),
     pipeReduceConn: $("pipe-reduce-conn"),
@@ -168,23 +173,72 @@
       .replace(/"/g, "&quot;");
   }
 
-  function renderTaskCell(task) {
+  function partitionIndex(partitions) {
+    const index = new Map();
+    for (const p of partitions || []) {
+      index.set(Number(p.reduce_id), p);
+    }
+    return index;
+  }
+
+  /**
+   * Infer Reduce task phase from partition readiness:
+   * - shuffle: in_progress + partition not fully ready (Worker polling)
+   * - compute: in_progress + partition ready (streaming merge + reduce)
+   */
+  function analyzeReducePhases(reduceTasks, partitions) {
+    const byReduce = partitionIndex(partitions);
+    const phases = new Map();
+    const shuffling = [];
+    const computing = [];
+
+    for (const task of reduceTasks || []) {
+      if (task.state !== "in_progress") continue;
+      const rid = Number(task.reduce_id ?? task.id);
+      const part = byReduce.get(rid);
+      const ready = Boolean(part?.ready);
+      const mapsReady = Number(part?.maps_ready ?? 0);
+      const mapsTotal = Number(part?.maps_total ?? 0);
+      const phase = ready ? "compute" : "shuffle";
+      const info = { task, rid, phase, mapsReady, mapsTotal, ready };
+      phases.set(task.id, info);
+      if (phase === "shuffle") shuffling.push(info);
+      else computing.push(info);
+    }
+
+    return { phases, shuffling, computing };
+  }
+
+  function renderTaskCell(task, reducePhase) {
     const classes = ["task-cell", task.state];
     if (task.speculative_risk) classes.push("speculative");
+    if (reducePhase === "shuffle") classes.push("phase-shuffle");
+    if (reducePhase === "compute") classes.push("phase-compute");
+
     const details = [];
+    if (task.type === "reduce" && reducePhase === "shuffle") details.push("Shuffle 收集中");
+    else if (task.type === "reduce" && reducePhase === "compute") details.push("Reduce 计算");
     if (task.worker_id) details.push(task.worker_id);
     if (task.elapsed_ms) details.push(formatMs(task.elapsed_ms));
     if (task.attempt_id > 0) details.push(`a${task.attempt_id}`);
     if (task.retry_count > 0) details.push(`r${task.retry_count}`);
-    const riskIcon = task.speculative_risk ? ' ⚡' : '';
+
+    const stateLabel =
+      task.type === "reduce" && reducePhase === "shuffle"
+        ? "shuffle"
+        : task.type === "reduce" && reducePhase === "compute"
+          ? "reduce"
+          : task.state.replace("_", " ");
+    const riskIcon = task.speculative_risk ? " ⚡" : "";
+
     return `<div class="${classes.join(" ")}" title="${escapeHtml(task.input_file || "")}">
       <span class="task-id">${task.type}-${task.id}${riskIcon}</span>
-      <span class="task-state">${task.state.replace("_", " ")}</span>
+      <span class="task-state">${stateLabel}</span>
       <span class="task-detail">${escapeHtml(details.join(" · ") || "—")}</span>
     </div>`;
   }
 
-  function renderTaskGrid(el, tasks) {
+  function renderTaskGrid(el, tasks, phaseMap) {
     const maxVisible = 240;
     const list = tasks || [];
     const visible = list.slice(0, maxVisible);
@@ -196,24 +250,122 @@
           <span class="task-detail">大文件任务已汇总，避免前端渲染阻塞</span>
         </div>`
       : "";
-    el.innerHTML = visible.map(renderTaskCell).join("") + overflowCell;
+    el.innerHTML =
+      visible.map((task) => renderTaskCell(task, phaseMap?.get(task.id)?.phase)).join("") +
+      overflowCell;
   }
 
-  function renderWorker(w) {
+  function renderReduceShuffleCard(info) {
+    const ratio = pct(info.mapsReady, info.mapsTotal);
+    const cls = ["reduce-shuffle-cell", info.phase];
+    return `<article class="${cls.join(" ")}">
+      <div class="reduce-shuffle-top">
+        <span class="reduce-shuffle-id">R${info.rid}</span>
+        <span class="reduce-shuffle-phase">${info.phase === "shuffle" ? "Shuffle 收集中" : "Reduce 计算"}</span>
+      </div>
+      <div class="reduce-shuffle-bar"><div class="reduce-shuffle-fill" style="width:${ratio}%"></div></div>
+      <div class="reduce-shuffle-meta">
+        ${info.mapsReady}/${info.mapsTotal} 中间文件
+        ${info.task.worker_id ? ` · ${escapeHtml(info.task.worker_id)}` : ""}
+        ${info.task.elapsed_ms ? ` · ${formatMs(info.task.elapsed_ms)}` : ""}
+      </div>
+    </article>`;
+  }
+
+  function renderReduceShuffleTrack(reduceTasks, partitions, unlocked, running) {
+    const { shuffling, computing } = analyzeReducePhases(reduceTasks, partitions);
+    const active = [...shuffling, ...computing];
+    const hasCards = active.length > 0;
+
+    if (els.reduceShuffleCount) {
+      els.reduceShuffleCount.textContent = String(active.length);
+    }
+    if (els.reduceShuffleEmpty) {
+      els.reduceShuffleEmpty.classList.toggle("hidden", hasCards);
+      if (!hasCards) {
+        if (unlocked && running) {
+          els.reduceShuffleEmpty.textContent =
+            "Slow Start 已解锁，等待 Worker 领取 Reduce 并开始 Shuffle…";
+        } else if (unlocked) {
+          els.reduceShuffleEmpty.textContent = "Slow Start 已解锁，当前无进行中的 Reduce Shuffle";
+        } else {
+          els.reduceShuffleEmpty.textContent =
+            "尚未解锁 — 等待 Map 完成率到达 Slow Start 阈值";
+        }
+      }
+    }
+    if (els.reduceShuffleGrid) {
+      els.reduceShuffleGrid.innerHTML = active.map(renderReduceShuffleCard).join("");
+    }
+
+    if (!els.reduceShuffleSummary) return { shuffling, computing, active };
+
+    if (shuffling.length > 0) {
+      els.reduceShuffleSummary.textContent = `${shuffling.length} 个收集中`;
+    } else if (computing.length > 0) {
+      els.reduceShuffleSummary.textContent = `${computing.length} 个计算中`;
+    } else if (unlocked && running) {
+      els.reduceShuffleSummary.textContent = "已解锁 · 等待调度";
+    } else if (unlocked) {
+      els.reduceShuffleSummary.textContent = "已解锁";
+    } else {
+      els.reduceShuffleSummary.textContent = "未解锁";
+    }
+
+    return { shuffling, computing, active };
+  }
+
+  function workerAssignmentIndex(mapTasks, reduceTasks) {
+    const index = new Map();
+    for (const task of [...(mapTasks || []), ...(reduceTasks || [])]) {
+      if (task.state !== "in_progress" || !task.worker_id) continue;
+      index.set(task.worker_id, { type: task.type || "task", id: task.id });
+    }
+    return index;
+  }
+
+  function workerCurrentAssignment(w, assignmentIndex) {
+    const fromTask = assignmentIndex?.get(w.id);
+    if (fromTask) return fromTask;
+    if (Number(w.current_task) >= 0) {
+      return { type: w.current_type || "task", id: w.current_task };
+    }
+    return null;
+  }
+
+  function formatWorkerTaskType(type) {
+    if (type === "map") return "Map";
+    if (type === "reduce") return "Reduce";
+    return type;
+  }
+
+  function formatWorkerAssignmentLabel(assignment, reducePhases) {
+    if (!assignment) return null;
+    if (assignment.type === "reduce") {
+      const phase = reducePhases?.phases?.get(assignment.id)?.phase;
+      if (phase === "shuffle") return `Reduce R${assignment.id} · Shuffle`;
+      if (phase === "compute") return `Reduce R${assignment.id} · 计算`;
+    }
+    return `${formatWorkerTaskType(assignment.type)} #${assignment.id}`;
+  }
+
+  function renderWorker(w, assignmentIndex, reducePhases) {
+    const assignment = workerCurrentAssignment(w, assignmentIndex);
     const cls = ["worker-card"];
     if (w.blacklisted) cls.push("blacklisted");
+    else if (assignment) cls.push("busy");
     else if (w.alive) cls.push("alive");
     if (!w.alive && !w.blacklisted) cls.push("dead");
 
     const badges = [];
     if (w.blacklisted) badges.push('<span class="badge blacklist">拉黑</span>');
+    else if (assignment) badges.push('<span class="badge busy">执行中</span>');
     else if (w.alive) badges.push('<span class="badge alive">在线</span>');
     else badges.push('<span class="badge dead">离线</span>');
 
-    const taskLine =
-      w.current_task >= 0
-        ? `<strong>${w.current_type || "task"} #${w.current_task}</strong>`
-        : "空闲";
+    const taskLine = assignment
+      ? `<strong>${escapeHtml(formatWorkerAssignmentLabel(assignment, reducePhases) || "")}</strong>`
+      : "空闲";
 
     return `<article class="${cls.join(" ")}">
       <div class="worker-top">
@@ -325,11 +477,13 @@
     }
   }
 
-  function updatePipeline(job, prog) {
+  function updatePipeline(job, prog, reduceShuffle) {
     const mapPct = pct(prog.map_completed, prog.map_total);
     const reducePct = pct(prog.reduce_completed, prog.reduce_total);
     const unlocked = prog.reduce_scheduling_unlocked;
     const running = job.state === "running";
+    const shuffling = reduceShuffle?.shuffling?.length ?? 0;
+    const computing = reduceShuffle?.computing?.length ?? 0;
 
     els.pipeMapPct.textContent = `${mapPct}%`;
     els.pipeMapBar.style.width = `${mapPct}%`;
@@ -341,19 +495,30 @@
     const reduceNode = els.pipeline?.querySelector(".pipe-node--reduce");
 
     mapNode?.classList.toggle("active", running && mapPct < 100);
-    shuffleNode?.classList.toggle("active", running && unlocked);
-    reduceNode?.classList.toggle("active", running && (reducePct > 0 || unlocked));
+    shuffleNode?.classList.toggle("active", running && shuffling > 0);
+    shuffleNode?.classList.toggle("unlocked", unlocked && shuffling === 0);
+    reduceNode?.classList.toggle("active", running && (computing > 0 || reducePct > 0));
 
-    if (unlocked) {
-      els.pipeShuffleLabel.textContent = running ? "进行中" : "已解锁";
+    if (shuffling > 0) {
+      els.pipeShuffleLabel.textContent = `${shuffling} 收集中`;
+      if (els.pipeShuffleHint) els.pipeShuffleHint.textContent = "轮询中间文件";
+    } else if (unlocked && running) {
+      els.pipeShuffleLabel.textContent = computing > 0 ? "收齐" : "已解锁";
+      if (els.pipeShuffleHint) {
+        els.pipeShuffleHint.textContent = computing > 0 ? "等待下一批" : "可调度 Reduce";
+      }
+    } else if (unlocked) {
+      els.pipeShuffleLabel.textContent = "已解锁";
+      if (els.pipeShuffleHint) els.pipeShuffleHint.textContent = "慢启动";
     } else {
       const threshold = Math.round((prog.reduce_slow_start_threshold ?? 0.8) * 100);
       const mapRatio = Math.round((prog.map_ratio ?? 0) * 100);
       els.pipeShuffleLabel.textContent = `${mapRatio}%/${threshold}%`;
+      if (els.pipeShuffleHint) els.pipeShuffleHint.textContent = "等待阈值";
     }
 
-    els.pipeShuffleConn?.classList.toggle("flowing", running && unlocked && mapPct < 100);
-    els.pipeReduceConn?.classList.toggle("flowing", running && unlocked && reducePct < 100);
+    els.pipeShuffleConn?.classList.toggle("flowing", running && shuffling > 0 && mapPct < 100);
+    els.pipeReduceConn?.classList.toggle("flowing", running && (computing > 0 || reducePct > 0));
   }
 
   function renderHistoryItem(job) {
@@ -461,8 +626,14 @@
     const mapRatio = Math.round((prog.map_ratio ?? 0) * 100);
     els.slowstartDetail.textContent = `Map ${mapRatio}% · 阈值 ${threshold}%`;
 
-    prog.reduce_partitions_ready = (data.reduce_partitions || []).filter((p) => p.ready).length;
-    updatePipeline(job, prog);
+    const reducePhases = analyzeReducePhases(data.reduce_tasks, data.reduce_partitions);
+    const reduceShuffle = renderReduceShuffleTrack(
+      data.reduce_tasks,
+      data.reduce_partitions,
+      prog.reduce_scheduling_unlocked,
+      job.state === "running"
+    );
+    updatePipeline(job, prog, reduceShuffle);
     renderOptimizations(data, prog);
 
     const cfg = job.config || {};
@@ -492,12 +663,15 @@
     ]);
 
     const workers = data.workers || [];
+    const workerAssignments = workerAssignmentIndex(data.map_tasks, data.reduce_tasks);
     els.workerCount.textContent = String(workers.length);
     els.workersEmpty.classList.toggle("hidden", workers.length > 0);
-    els.workersGrid.innerHTML = workers.map(renderWorker).join("");
+    els.workersGrid.innerHTML = workers
+      .map((w) => renderWorker(w, workerAssignments, reducePhases))
+      .join("");
 
     renderTaskGrid(els.mapTasks, data.map_tasks || []);
-    renderTaskGrid(els.reduceTasks, data.reduce_tasks || []);
+    renderTaskGrid(els.reduceTasks, data.reduce_tasks || [], reducePhases.phases);
     els.partitionGrid.innerHTML = (data.reduce_partitions || []).map(renderPartition).join("");
 
     const decisions = data.decisions || [];

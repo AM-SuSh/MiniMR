@@ -144,7 +144,7 @@ func JobLogPath(jobID string) string {
 }
 
 func (job *Job) snapshotWorkersLocked(workers map[string]*WorkerInfo, now time.Time, timeout time.Duration) {
-	job.WorkerSnapshot = workersToDashboard(workers, now, timeout)
+	job.WorkerSnapshot = workersToDashboard(workers, job, now, timeout)
 }
 
 func (job *Job) closeJobLog() {

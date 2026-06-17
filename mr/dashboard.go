@@ -225,7 +225,7 @@ func (m *Master) snapshotWithTM(job *Job, tm *TaskManager, now time.Time) Dashbo
 
 	snap.MapTasks = tasksToDashboard(job.MapTasks, &taskInsight{mapMedian, len(tm.completedMapTimes)}, now)
 	snap.ReduceTasks = tasksToDashboard(job.ReduceTasks, &taskInsight{reduceMedian, len(tm.completedReduceTimes)}, now)
-	snap.Workers = workersToDashboard(tm.workers, now, tm.workerTimeout)
+	snap.Workers = workersToDashboard(tm.workers, job, now, tm.workerTimeout)
 	snap.ReducePartitions = partitionStatus(job)
 	snap.Optimizations = optimizationSnapshot(job, snap.Progress, snap.Workers)
 	snap.Decisions = copyDecisions(tm.decisions)
@@ -400,19 +400,48 @@ func tasksToDashboard(tasks []*Task, insight *taskInsight, now time.Time) []Dash
 	return out
 }
 
-func workersToDashboard(workers map[string]*WorkerInfo, now time.Time, timeout time.Duration) []DashboardWorker {
+type workerAssignment struct {
+	taskID   int
+	taskType string
+}
+
+func inProgressWorkerAssignments(job *Job) map[string]workerAssignment {
+	if job == nil {
+		return nil
+	}
+	out := make(map[string]workerAssignment)
+	for _, task := range job.MapTasks {
+		if task.State == InProgress && task.WorkerID != "" {
+			out[task.WorkerID] = workerAssignment{taskID: task.ID, taskType: task.Type.String()}
+		}
+	}
+	for _, task := range job.ReduceTasks {
+		if task.State == InProgress && task.WorkerID != "" {
+			out[task.WorkerID] = workerAssignment{taskID: task.ID, taskType: task.Type.String()}
+		}
+	}
+	return out
+}
+
+func workersToDashboard(workers map[string]*WorkerInfo, job *Job, now time.Time, timeout time.Duration) []DashboardWorker {
+	assignments := inProgressWorkerAssignments(job)
 	out := make([]DashboardWorker, 0, len(workers))
 	for _, w := range workers {
 		alive := !w.Blacklisted && now.Sub(w.LastHeartbeat) <= timeout
-		ct := ""
-		if w.CurrentTask >= 0 {
-			ct = w.CurrentType.String()
+		currentTask := w.CurrentTask
+		currentType := ""
+		if currentTask >= 0 {
+			currentType = w.CurrentType.String()
+		}
+		if a, ok := assignments[w.ID]; ok {
+			currentTask = a.taskID
+			currentType = a.taskType
 		}
 		out = append(out, DashboardWorker{
 			ID:            w.ID,
 			LastHeartbeat: w.LastHeartbeat.Format(time.RFC3339),
-			CurrentTask:   w.CurrentTask,
-			CurrentType:   ct,
+			CurrentTask:   currentTask,
+			CurrentType:   currentType,
 			FailureCount:  w.FailureCount,
 			Blacklisted:   w.Blacklisted,
 			Alive:         alive,
