@@ -15,8 +15,10 @@
 
 # 调度日志（运行时生成）
 /logs/
+*.log
 /bin/
 *.exe
+/checkpoints
 
 # plugin 模式：插件源码与 .so 动态库
 /udf/plugins/

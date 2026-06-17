@@ -268,6 +268,37 @@ func (m *Master) jobHistoryLocked(selected *Job, now time.Time) []DashboardJobSu
 		}
 		out = append(out, row)
 	}
+	seen := make(map[string]bool, len(out))
+	for _, row := range out {
+		seen[row.ID] = true
+	}
+	if archived, err := ListAllCheckpointJobs(); err == nil {
+		for _, r := range archived {
+			if seen[r.ID] {
+				continue
+			}
+			row := DashboardJobSummary{
+				ID:              r.ID,
+				State:           r.State,
+				CreatedAt:       r.CreatedAt,
+				InputFiles:      r.InputFiles,
+				NMap:            r.NMap,
+				NReduce:         r.NReduce,
+				WorkDir:         r.WorkDir,
+				MapCompleted:    r.MapDone,
+				MapTotal:        r.MapTotal,
+				ReduceCompleted: r.ReduceDone,
+				ReduceTotal:     r.ReduceTotal,
+				IsSelected:      selected != nil && selected.ID == r.ID,
+			}
+			if !r.CompletedAt.IsZero() {
+				t := r.CompletedAt
+				row.CompletedAt = &t
+			}
+			out = append(out, row)
+			seen[r.ID] = true
+		}
+	}
 	sort.Slice(out, func(i, j int) bool {
 		if out[i].CreatedAt.Equal(out[j].CreatedAt) {
 			return out[i].ID > out[j].ID

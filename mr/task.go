@@ -22,6 +22,7 @@ type TaskManager struct {
 	completedReduceTimes  []time.Duration
 	decisions             []DecisionEvent
 	reduceSlowStartLogged bool
+	lastCheckpointSave    time.Time
 }
 
 func NewTaskManager(job *Job) *TaskManager {
@@ -172,6 +173,21 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, m
 		}
 	}
 	tm.job.snapshotWorkersLocked(tm.workers, time.Now(), tm.workerTimeout)
+	tm.maybeCheckpointLocked(time.Now())
+}
+
+func (tm *TaskManager) maybeCheckpointLocked(now time.Time) {
+	if tm.job == nil || tm.job.State != JobRunning {
+		return
+	}
+	if !tm.lastCheckpointSave.IsZero() && now.Sub(tm.lastCheckpointSave) < 10*time.Second {
+		return
+	}
+	if err := SaveJobCheckpoint(tm.job); err != nil {
+		log.Printf("checkpoint save failed for job %s: %v", tm.job.ID, err)
+	} else {
+		tm.lastCheckpointSave = now
+	}
 }
 
 func (tm *TaskManager) ResetTask(task *Task) {
@@ -255,6 +271,7 @@ func (tm *TaskManager) checkTimeouts() {
 	for _, task := range tm.job.ReduceTasks {
 		tm.checkSingleTaskLocked(task, now, reduceMedian, len(tm.completedReduceTimes))
 	}
+	tm.maybeCheckpointLocked(now)
 }
 
 func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median time.Duration, completedCount int) {

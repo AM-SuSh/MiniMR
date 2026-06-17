@@ -144,7 +144,77 @@ func (m *Master) StartJob(config JobConfig) (*Job, error) {
 	reserved = false
 
 	go tm.StartMonitor(m.done)
+	_ = SaveJobCheckpoint(job)
 	return job, nil
+}
+
+// RecoverJob reloads an interrupted job from checkpoint and resumes scheduling.
+func (m *Master) RecoverJob(jobID string) (*Job, error) {
+	if jobID == "" {
+		return nil, fmt.Errorf("job id is required")
+	}
+
+	m.mu.Lock()
+	if err := m.canStartJobLocked(time.Now()); err != nil {
+		m.mu.Unlock()
+		return nil, err
+	}
+	m.starting = true
+	m.mu.Unlock()
+
+	release := func() {
+		m.mu.Lock()
+		m.starting = false
+		m.mu.Unlock()
+	}
+
+	job, err := RebuildJobFromCheckpoint(jobID)
+	if err != nil {
+		release()
+		return nil, err
+	}
+
+	if err := reopenJobLog(job); err != nil {
+		release()
+		return nil, fmt.Errorf("reopen job log: %w", err)
+	}
+
+	tm := NewTaskManager(job)
+	tm.mu.Lock()
+	tm.decisions = copyDecisions(job.Decisions)
+	tm.mu.Unlock()
+
+	m.mu.Lock()
+	m.jobs[job.ID] = job
+	m.current = job
+	m.tm = tm
+	m.starting = false
+	if job.State == JobCompleted {
+		m.finalizeJobLocked(job, job.CompletedAt)
+		m.mu.Unlock()
+		_ = SaveJobCheckpoint(job)
+		log.Printf("recovered job %s already complete", job.ID)
+		return job, nil
+	}
+	m.mu.Unlock()
+
+	go tm.StartMonitor(m.done)
+	_ = SaveJobCheckpoint(job)
+	log.Printf("recovered job %s (map %d/%d, reduce %d/%d)",
+		job.ID,
+		countTasksCompleted(job.MapTasks), len(job.MapTasks),
+		countTasksCompleted(job.ReduceTasks), len(job.ReduceTasks))
+	return job, nil
+}
+
+func countTasksCompleted(tasks []*Task) int {
+	n := 0
+	for _, t := range tasks {
+		if t.State == Completed {
+			n++
+		}
+	}
+	return n
 }
 
 func (m *Master) canStartJobLocked(now time.Time) error {
@@ -418,12 +488,26 @@ func (m *Master) Serve() error {
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/job", m.withCORS(m.handleSubmitJob))
+	mux.HandleFunc("/api/recover", m.withCORS(m.handleRecoverJob))
+	mux.HandleFunc("/api/recoverable", m.withCORS(m.handleListRecoverable))
 	mux.HandleFunc("/api/status", m.withCORS(m.handleStatus))
 	mux.HandleFunc("/api/result", m.withCORS(m.handleResult))
 	mux.HandleFunc("/api/dashboard", m.withCORS(m.handleDashboard))
 	mux.Handle("/", http.FileServer(http.Dir("web")))
 
 	log.Printf("Master HTTP listening on %s (dashboard: http://localhost%s/)", m.httpAddr, m.httpAddr)
+	if err := m.LoadArchivedJobsFromCheckpoints(); err != nil {
+		log.Printf("checkpoint archive load: %v", err)
+	}
+	if jobs, err := ListRecoverableJobs(); err != nil {
+		log.Printf("checkpoint scan: %v", err)
+	} else if len(jobs) > 0 {
+		log.Printf("recoverable jobs: %d (POST /api/recover {\"job_id\":\"...\"})", len(jobs))
+		for _, j := range jobs {
+			log.Printf("  - %s map %d/%d reduce %d/%d saved %s",
+				j.ID, j.MapDone, j.MapTotal, j.ReduceDone, j.ReduceTotal, j.SavedAt.Format(time.RFC3339))
+		}
+	}
 	return http.ListenAndServe(m.httpAddr, mux)
 }
 
@@ -485,6 +569,58 @@ func (m *Master) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+type recoverJobRequest struct {
+	JobID string `json:"job_id"`
+}
+
+func (m *Master) handleRecoverJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req recoverJobRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	job, err := m.RecoverJob(req.JobID)
+	if err != nil {
+		status := http.StatusInternalServerError
+		if errors.Is(err, ErrJobAlreadyRunning) {
+			status = http.StatusConflict
+		}
+		if errors.Is(err, ErrJobNotRecoverable) {
+			status = http.StatusBadRequest
+		}
+		http.Error(w, err.Error(), status)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(submitJobResponse{
+		JobID: job.ID,
+		State: job.State.String(),
+	})
+}
+
+func (m *Master) handleListRecoverable(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	jobs, err := ListRecoverableJobs()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if jobs == nil {
+		jobs = []RecoverableJobSummary{}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"jobs": jobs,
+	})
+}
+
 func (m *Master) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -498,6 +634,33 @@ func (m *Master) withCORS(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
+func (m *Master) tryAutoRecover(jobID string) (*Job, error) {
+	if jobID == "" {
+		return nil, fmt.Errorf("empty job id")
+	}
+	m.mu.Lock()
+	if job, ok := m.jobs[jobID]; ok {
+		m.mu.Unlock()
+		return job, nil
+	}
+	m.mu.Unlock()
+
+	cp, err := loadJobCheckpoint(jobID)
+	if err != nil {
+		return nil, err
+	}
+	if !isRecoverableCheckpoint(cp) {
+		return nil, ErrJobNotRecoverable
+	}
+	return m.RecoverJob(jobID)
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload interface{}) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
 func (m *Master) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -507,7 +670,25 @@ func (m *Master) handleDashboard(w http.ResponseWriter, r *http.Request) {
 	jobID := r.URL.Query().Get("job")
 	m.mu.Lock()
 	job := m.lookupJobLocked(jobID)
+	hasCurrent := m.current != nil
 	m.mu.Unlock()
+
+	if job == nil {
+		target := jobID
+		if target == "" && !hasCurrent {
+			if list, err := ListRecoverableJobs(); err == nil && len(list) > 0 {
+				target = list[0].ID
+				log.Printf("dashboard: auto-recovering latest interrupted job %s", target)
+			}
+		}
+		if target != "" {
+			if recovered, err := m.tryAutoRecover(target); err == nil {
+				job = recovered
+			} else if errors.Is(err, ErrJobAlreadyRunning) {
+				log.Printf("dashboard: skip auto-recover %s: %v", target, err)
+			}
+		}
+	}
 
 	if job == nil {
 		w.Header().Set("Content-Type", "application/json")
@@ -522,12 +703,38 @@ func (m *Master) handleDashboard(w http.ResponseWriter, r *http.Request) {
 
 func (m *Master) handleStatus(w http.ResponseWriter, r *http.Request) {
 	jobID := r.URL.Query().Get("job")
+	if jobID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]interface{}{
+			"error": "job id is required",
+		})
+		return
+	}
+
 	m.mu.Lock()
 	job := m.lookupJobLocked(jobID)
 	m.mu.Unlock()
 
 	if job == nil {
-		http.Error(w, "job not found", http.StatusNotFound)
+		recovered, err := m.tryAutoRecover(jobID)
+		if err == nil {
+			job = recovered
+			log.Printf("status poll: auto-recovered job %s", jobID)
+		} else if errors.Is(err, ErrJobAlreadyRunning) {
+			if payload, cpErr := StatusFromCheckpoint(jobID); cpErr == nil {
+				writeJSON(w, http.StatusOK, payload)
+				return
+			}
+		}
+	}
+	if job == nil {
+		if payload, err := StatusFromCheckpoint(jobID); err == nil {
+			writeJSON(w, http.StatusOK, payload)
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]interface{}{
+			"error":  "job not found",
+			"job_id": jobID,
+		})
 		return
 	}
 

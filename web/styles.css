@@ -1614,9 +1614,12 @@ code {
 .decision-type.fail,
 .decision-type.blacklist,
 .decision-type.job_failed { color: var(--red); }
-.decision-type.job_completed { color: var(--green); }
+.decision-type.job_completed,
+.decision-type.master_online,
+.decision-type.job_resumed { color: var(--green); }
 .decision-type.reduce_slow_start { color: var(--violet); }
 .decision-type.worker_timeout { color: var(--amber); }
+.decision-type.master_offline { color: var(--red); }
 
 .decision-row.decision-banner {
   margin-top: 8px;
@@ -1639,6 +1642,17 @@ code {
 .decision-row.decision-type-job_failed {
   border-color: rgba(248, 113, 113, 0.25);
   background: rgba(248, 113, 113, 0.06);
+}
+
+.decision-row.decision-type-master_offline {
+  border-color: rgba(248, 113, 113, 0.25);
+  background: rgba(248, 113, 113, 0.06);
+}
+
+.decision-row.decision-type-master_online,
+.decision-row.decision-type-job_resumed {
+  border-color: rgba(74, 222, 128, 0.25);
+  background: rgba(74, 222, 128, 0.06);
 }
 
 .decision-msg {

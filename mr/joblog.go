@@ -154,4 +154,29 @@ func (job *Job) closeJobLog() {
 	job.jobLog.writeFinish(job.State, job.Error)
 	job.jobLog.close()
 	job.jobLog = nil
+	_ = SaveJobCheckpoint(job)
+}
+
+func reopenJobLog(job *Job) error {
+	if err := os.MkdirAll(JobLogDir, 0755); err != nil {
+		return err
+	}
+	path := filepath.Join(JobLogDir, job.ID+".log")
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return err
+	}
+	w := &jobLogWriter{jobID: job.ID, f: f}
+	if err := w.write(jobLogRecord{
+		Time:    time.Now(),
+		Kind:    "recover",
+		JobID:   job.ID,
+		State:   job.State.String(),
+		Message: fmt.Sprintf("master recovered job %s from checkpoint", job.ID),
+	}); err != nil {
+		f.Close()
+		return err
+	}
+	job.jobLog = w
+	return nil
 }

@@ -74,11 +74,25 @@
   let timer = null;
   let decisionsJobId = "";
   let decisionsFingerprint = "";
+  let masterWasOnline = true;
+  let sessionDecisionsByJob = {};
+  let resumeAnnouncedForJob = "";
+  let lastTrackedJobId = "";
+  let dashboardEverShown = false;
+
+  const sessionBannerTypes = new Set([
+    "job_completed",
+    "job_failed",
+    "master_offline",
+    "master_online",
+    "job_resumed",
+  ]);
 
   const stateLabels = {
     running: "作业运行中",
     completed: "作业已完成",
     failed: "作业失败",
+    recoverable: "可恢复（中断）",
     pending: "等待调度",
   };
 
@@ -103,7 +117,12 @@
 
   function formatTime(iso) {
     if (!iso) return "—";
-    return new Date(iso).toLocaleTimeString("zh-CN", { hour12: false });
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return "—";
+    const h = String(d.getHours()).padStart(2, "0");
+    const m = String(d.getMinutes()).padStart(2, "0");
+    const s = String(d.getSeconds()).padStart(2, "0");
+    return `${h}:${m}:${s}`;
   }
 
   function formatDateTime(iso) {
@@ -388,10 +407,46 @@
     </div>`;
   }
 
+  function sessionDecisionsForJob(jobId) {
+    if (!jobId) return [];
+    return sessionDecisionsByJob[jobId] || [];
+  }
+
+  function pushSessionDecision(jobId, type, message) {
+    if (!jobId) return;
+    const list = sessionDecisionsForJob(jobId);
+    const last = list[list.length - 1];
+    if (last && last.type === type && last.message === message) return;
+    list.push({
+      type,
+      message,
+      time: new Date().toISOString(),
+    });
+    if (list.length > 200) {
+      sessionDecisionsByJob[jobId] = list.slice(-200);
+    } else {
+      sessionDecisionsByJob[jobId] = list;
+    }
+  }
+
+  function decisionTimeMs(d) {
+    if (!d || !d.time) return 0;
+    const t = new Date(d.time).getTime();
+    return Number.isFinite(t) ? t : 0;
+  }
+
+  function sortDecisionsByTime(list) {
+    return [...list].sort((a, b) => decisionTimeMs(a) - decisionTimeMs(b));
+  }
+
+  function mergeSessionDecisions(decisions, jobId) {
+    return sortDecisionsByTime([...(decisions || []), ...sessionDecisionsForJob(jobId)]);
+  }
+
   function renderDecision(d) {
     const t = d.time ? formatTime(d.time) : "—";
     const type = (d.type || "unknown").replace(/\./g, "_");
-    const isBanner = d.type === "job_completed" || d.type === "job_failed";
+    const isBanner = sessionBannerTypes.has(d.type);
     if (isBanner) {
       return `<div class="decision-row decision-banner decision-type-${type}">
         <span class="decision-time">${t}</span>
@@ -413,7 +468,11 @@
   }
 
   function decisionsForDisplay(decisions, job, prog) {
-    const list = [...(decisions || [])];
+    const jobId = job?.id || "";
+    const list = mergeSessionDecisions(decisions, jobId);
+    if (!job || !job.id) {
+      return list;
+    }
     if (job.state === "completed" && !list.some((d) => d.type === "job_completed")) {
       list.push({
         type: "job_completed",
@@ -430,7 +489,7 @@
         message: `════ 作业失败 ════ Map ${mapLine} · Reduce ${reduceLine} · ${detail}`,
       });
     }
-    return list;
+    return sortDecisionsByTime(list);
   }
 
   function renderDecisionsLog(decisions, job, prog) {
@@ -439,10 +498,13 @@
 
     const list = decisionsForDisplay(decisions, job, prog);
     const fp = decisionFingerprint(list);
-    const jobSwitched = job.id !== decisionsJobId;
+    const jobSwitched = job && job.id !== decisionsJobId;
 
-    if (jobSwitched) {
+    if (job && jobSwitched) {
       decisionsJobId = job.id;
+      decisionsFingerprint = "";
+    } else if (!job && decisionsJobId) {
+      decisionsJobId = "";
       decisionsFingerprint = "";
     }
 
@@ -454,7 +516,7 @@
     const prevHeight = logEl.scrollHeight;
     const clientHeight = logEl.clientHeight;
     const wasPinnedBottom = prevHeight - clientHeight - prevScrollTop < 48;
-    const isRunning = job.state === "running";
+    const isRunning = job && job.state === "running";
 
     decisionsFingerprint = fp;
 
@@ -532,7 +594,7 @@
     if (job.is_current) classes.push("current");
     const input = (job.input_files || []).map((p) => p.split(/[\\/]/).pop()).join(", ") || "—";
     const time = job.completed_at || job.created_at;
-    return `<button class="${classes.join(" ")}" type="button" data-job-id="${escapeHtml(job.id)}" title="${escapeHtml(job.id)}">
+    return `<button class="${classes.join(" ")}" type="button" data-job-id="${escapeHtml(job.id)}" data-job-state="${escapeHtml(job.state || "")}" title="${escapeHtml(job.id)}">
       <span class="history-id">${escapeHtml(shortJobID(job.id))}</span>
       <span class="history-state">${escapeHtml(job.state || "unknown")}${job.is_current ? " · current" : ""}</span>
       <span class="history-input">${escapeHtml(input)}</span>
@@ -603,16 +665,26 @@
     if (!data.job || !data.job.id) {
       els.emptyState.classList.remove("hidden");
       els.dashboard.classList.add("hidden");
-      els.pollStatus.textContent = "已连接 · 无作业";
+      const recoverable = (data.job_history || []).filter((j) => j.state === "recoverable");
+      if (recoverable.length > 0) {
+        els.pollStatus.textContent = `已连接 · ${recoverable.length} 个可恢复作业（点击历史记录或填写 Job ID）`;
+      } else {
+        els.pollStatus.textContent = "已连接 · 无当前作业";
+      }
+      renderDecisionsLog([], null, null);
       setLiveState("live");
       return;
     }
 
     els.emptyState.classList.add("hidden");
     els.dashboard.classList.remove("hidden");
+    dashboardEverShown = true;
 
     const job = data.job;
     const prog = data.progress || {};
+    if (job?.id) {
+      lastTrackedJobId = job.id;
+    }
 
     els.heroJobLabel.textContent = stateLabels[job.state] || "作业状态";
     els.jobState.textContent = job.state;
@@ -699,9 +771,58 @@
     if (paused) return;
     try {
       const data = await fetchDashboard();
+      let justReconnected = false;
+      const sessionJobId =
+        data.job?.id || els.jobId.value.trim() || lastTrackedJobId;
+      if (!masterWasOnline) {
+        pushSessionDecision(
+          sessionJobId,
+          "master_online",
+          "════ Master 已恢复连接 ════ 调度服务重新可用"
+        );
+        masterWasOnline = true;
+        justReconnected = true;
+      }
+      if (
+        justReconnected &&
+        data.job &&
+        data.job.id &&
+        data.job.state === "running" &&
+        resumeAnnouncedForJob !== data.job.id
+      ) {
+        pushSessionDecision(
+          data.job.id,
+          "job_resumed",
+          `════ 作业已恢复调度 ════ Job ${shortJobID(data.job.id)} · 从 checkpoint 继续执行`
+        );
+        resumeAnnouncedForJob = data.job.id;
+      }
       render(data);
     } catch (err) {
-      els.pollStatus.textContent = "连接失败";
+      const sessionJobId = els.jobId.value.trim() || lastTrackedJobId;
+      if (masterWasOnline) {
+        pushSessionDecision(
+          sessionJobId,
+          "master_offline",
+          "════ Master 已退出 / 连接断开 ════ 调度暂停，请重启 Master 后恢复作业"
+        );
+        masterWasOnline = false;
+        resumeAnnouncedForJob = "";
+      }
+      const offlineJob = sessionJobId ? { id: sessionJobId } : null;
+      renderDecisionsLog([], offlineJob, null);
+      const sessionCount = sessionDecisionsForJob(sessionJobId).length;
+      if (dashboardEverShown || sessionCount > 0) {
+        els.emptyState.classList.add("hidden");
+        els.dashboard.classList.remove("hidden");
+      }
+      if (els.decisionsCard) {
+        els.decisionsCard.classList.toggle("card--log-filled", sessionCount > 0);
+      }
+      if (els.decisionsEmpty) {
+        els.decisionsEmpty.classList.toggle("hidden", sessionCount > 0);
+      }
+      els.pollStatus.textContent = "Master 离线";
       setLiveState("error");
     }
   }
@@ -735,10 +856,30 @@
     startPolling();
   });
 
-  els.jobHistory?.addEventListener("click", (event) => {
+  els.jobHistory?.addEventListener("click", async (event) => {
     const item = event.target.closest("[data-job-id]");
     if (!item) return;
-    els.jobId.value = item.dataset.jobId || "";
+    const jobId = item.dataset.jobId || "";
+    const state = item.dataset.jobState || "";
+    els.jobId.value = jobId;
+    if (state === "recoverable") {
+      try {
+        const res = await fetch(`${apiBase()}/api/recover`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ job_id: jobId }),
+        });
+        if (!res.ok) {
+          const text = await res.text();
+          els.pollStatus.textContent = `恢复失败: ${text}`;
+          return;
+        }
+        els.pollStatus.textContent = `已恢复作业 ${shortJobID(jobId)}`;
+      } catch (err) {
+        els.pollStatus.textContent = "恢复请求失败";
+        return;
+      }
+    }
     stopPolling();
     startPolling();
   });
