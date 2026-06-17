@@ -19,6 +19,7 @@ const (
 	DecisionReduceSlowStart DecisionType = "reduce_slow_start"
 	DecisionReduceReady     DecisionType = "reduce_ready"
 	DecisionJobFailed       DecisionType = "job_failed"
+	DecisionJobAborted      DecisionType = "job_aborted"
 	DecisionJobCompleted    DecisionType = "job_completed"
 )
 
@@ -53,6 +54,39 @@ func appendJobDecision(job *Job, ev DecisionEvent) {
 	if job.jobLog != nil {
 		job.jobLog.writeDecision(ev)
 	}
+}
+
+func jobFailedBannerEvent(job *Job, at time.Time, reason string) DecisionEvent {
+	mapDone, mapTotal := countCompleted(job.MapTasks)
+	reduceDone, reduceTotal := countCompleted(job.ReduceTasks)
+	return DecisionEvent{
+		Time: at,
+		Type: DecisionJobFailed,
+		Message: fmt.Sprintf(
+			"════ 作业失败 ════ Map %d/%d · Reduce %d/%d · %s",
+			mapDone, mapTotal, reduceDone, reduceTotal, reason,
+		),
+	}
+}
+
+func hasTerminalDecision(events []DecisionEvent, kind DecisionType) bool {
+	for i := len(events) - 1; i >= 0; i-- {
+		if events[i].Type == kind {
+			return true
+		}
+	}
+	return false
+}
+
+// LogJobFailedDecision appends a terminal banner for a failed job.
+func LogJobFailedDecision(job *Job, at time.Time, reason string) {
+	if job == nil || job.State != JobFailed {
+		return
+	}
+	if hasTerminalDecision(job.Decisions, DecisionJobFailed) {
+		return
+	}
+	appendJobDecision(job, jobFailedBannerEvent(job, at, reason))
 }
 
 // LogJobCompletedDecision appends a terminal banner for a finished job.

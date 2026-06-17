@@ -42,12 +42,23 @@ func (w *Worker) Run() {
 
 		switch reply.TaskType {
 		case MapTask:
-			success, metrics := w.doMap(reply)
-			w.report(reply.JobID, MapTask, reply.TaskID, reply.AttemptID, success, metrics)
+			if reply.JobState == JobFailed.String() {
+				log.Printf("Worker %s: job %s already failed, skipping map-%d", w.ID, reply.JobID, reply.TaskID)
+				break
+			}
+			success, metrics, reason := w.doMap(reply)
+			w.report(reply.JobID, MapTask, reply.TaskID, reply.AttemptID, success, metrics, reason)
 		case ReduceTask:
-			success, metrics := w.doReduce(reply)
-			w.report(reply.JobID, ReduceTask, reply.TaskID, reply.AttemptID, success, metrics)
+			if reply.JobState == JobFailed.String() {
+				log.Printf("Worker %s: job %s already failed, skipping reduce-%d", w.ID, reply.JobID, reply.TaskID)
+				break
+			}
+			success, metrics, reason := w.doReduce(reply)
+			w.report(reply.JobID, ReduceTask, reply.TaskID, reply.AttemptID, success, metrics, reason)
 		case WaitTask:
+			if reply.JobState == JobFailed.String() {
+				log.Printf("Worker %s: job %s failed, idle until next job", w.ID, reply.JobID)
+			}
 			time.Sleep(time.Second)
 		case ExitTask:
 			log.Printf("Worker %s received exit signal", w.ID)
@@ -67,16 +78,17 @@ func (w *Worker) heartbeatLoop() {
 	}
 }
 
-func (w *Worker) report(jobID string, taskType TaskType, taskID int, attemptID int, success bool, metrics TaskMetrics) {
+func (w *Worker) report(jobID string, taskType TaskType, taskID int, attemptID int, success bool, metrics TaskMetrics, failureReason string) {
 	var reply ReportTaskReply
 	_ = w.call("Master.ReportTask", &ReportTaskArgs{
-		WorkerID:  w.ID,
-		JobID:     jobID,
-		TaskType:  taskType,
-		TaskID:    taskID,
-		AttemptID: attemptID,
-		Success:   success,
-		Metrics:   metrics,
+		WorkerID:      w.ID,
+		JobID:         jobID,
+		TaskType:      taskType,
+		TaskID:        taskID,
+		AttemptID:     attemptID,
+		Success:       success,
+		Metrics:       metrics,
+		FailureReason: failureReason,
 	}, &reply)
 }
 
@@ -84,18 +96,20 @@ func (w *Worker) report(jobID string, taskType TaskType, taskID int, attemptID i
 // Map task: read split → MapFunc → Combine → partition → sort → write binary
 // ---------------------------------------------------------------------------
 
-func (w *Worker) doMap(reply RequestTaskReply) (bool, TaskMetrics) {
+func (w *Worker) doMap(reply RequestTaskReply) (bool, TaskMetrics, string) {
 	metrics := TaskMetrics{InputBytes: reply.InputLength}
 	mapFn, ok := GetMapFunc(reply.MapFunc)
 	if !ok {
+		reason := fmt.Sprintf("config: unknown map func %s", reply.MapFunc)
 		log.Printf("unknown map func: %s", reply.MapFunc)
-		return false, metrics
+		return false, metrics, reason
 	}
 
 	content, err := readSplit(reply.InputFile, reply.InputOffset, reply.InputLength)
 	if err != nil {
-		log.Printf("read split: %v", err)
-		return false, metrics
+		reason := fmt.Sprintf("input_read: %v", err)
+		log.Printf("read split %s [%d+%d]: %v", reply.InputFile, reply.InputOffset, reply.InputLength, err)
+		return false, metrics, reason
 	}
 
 	kvs := mapFn(reply.InputFile, content)
@@ -121,24 +135,26 @@ func (w *Worker) doMap(reply RequestTaskReply) (bool, TaskMetrics) {
 		outPath := intermediatePath(reply.WorkDir, reply.TaskID, r)
 		fileMetrics, err := atomicWriteBinaryWithStats(outPath, partitions[r], reply.JobID)
 		if err != nil {
+			reason := fmt.Sprintf("intermediate_write: %v", err)
 			log.Printf("write intermediate %s: %v", outPath, err)
-			return false, metrics
+			return false, metrics, reason
 		}
 		metrics.Add(fileMetrics)
 	}
-	return true, metrics
+	return true, metrics, ""
 }
 
 // ---------------------------------------------------------------------------
 // Reduce task: shuffle (poll files) → K-way heap merge → streaming reduce
 // ---------------------------------------------------------------------------
 
-func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics) {
+func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics, string) {
 	metrics := TaskMetrics{}
 	reduceFn, ok := GetReduceFunc(reply.ReduceFunc)
 	if !ok {
+		reason := fmt.Sprintf("config: unknown reduce func %s", reply.ReduceFunc)
 		log.Printf("unknown reduce func: %s", reply.ReduceFunc)
-		return false, metrics
+		return false, metrics, reason
 	}
 
 	// Phase 1  Shuffle — poll until every intermediate file is present.
@@ -162,10 +178,11 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics) {
 			break
 		}
 		if time.Now().After(shuffleDeadline) {
+			reason := fmt.Sprintf("shuffle_timeout: collected %d/%d intermediate files", collectCount, reply.NMap)
 			log.Printf("reduce %d: shuffle timed out (%d/%d files collected)",
 				reply.ReduceID, collectCount, reply.NMap)
 			metrics.ShuffleWaitMs = time.Since(shuffleStart).Milliseconds()
-			return false, metrics
+			return false, metrics, reason
 		}
 		time.Sleep(ReduceShufflePollInterval)
 	}
@@ -177,13 +194,14 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics) {
 		path := intermediatePath(reply.WorkDir, m, reply.ReduceID)
 		r, err := openKVStream(path)
 		if err != nil {
+			reason := fmt.Sprintf("intermediate_read: %v", err)
 			log.Printf("open intermediate %s: %v", path, err)
 			for _, rr := range readers {
 				if rr != nil {
 					rr.Close()
 				}
 			}
-			return false, metrics
+			return false, metrics, reason
 		}
 		readers[m] = r
 		metrics.ReduceOpenedStreams++
@@ -207,13 +225,15 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics) {
 	// Phase 3  Streaming merge-reduce: pop from heap, group by key, reduce.
 	outPath := filepath.Join(reply.WorkDir, fmt.Sprintf("mr-out-%d", reply.ReduceID))
 	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
+		reason := fmt.Sprintf("output_write: mkdir %v", err)
 		log.Printf("mkdir: %v", err)
-		return false, metrics
+		return false, metrics, reason
 	}
 	f, err := os.Create(outPath)
 	if err != nil {
+		reason := fmt.Sprintf("output_write: create %v", err)
 		log.Printf("create %s: %v", outPath, err)
-		return false, metrics
+		return false, metrics, reason
 	}
 	bw := bufio.NewWriterSize(f, 64*1024)
 
@@ -253,13 +273,13 @@ func (w *Worker) doReduce(reply RequestTaskReply) (bool, TaskMetrics) {
 	writeStart := time.Now()
 	if err := bw.Flush(); err != nil {
 		f.Close()
-		return false, metrics
+		return false, metrics, fmt.Sprintf("output_write: flush %v", err)
 	}
 	if err := f.Close(); err != nil {
-		return false, metrics
+		return false, metrics, fmt.Sprintf("output_write: close %v", err)
 	}
 	metrics.ReduceWriteMs = time.Since(writeStart).Milliseconds()
-	return true, metrics
+	return true, metrics, ""
 }
 
 // ===========================================================================

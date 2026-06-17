@@ -70,7 +70,7 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 		}
 		job.MapTasks = append(job.MapTasks, task)
 
-		ok, metrics := localWorker.doMap(RequestTaskReply{
+		ok, metrics, reason := localWorker.doMap(RequestTaskReply{
 			TaskType:    MapTask,
 			TaskID:      i,
 			InputFile:   split.File,
@@ -87,7 +87,13 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 		})
 		if !ok {
 			job.State = JobFailed
-			job.Error = fmt.Sprintf("map-%d failed", i)
+			if ClassifyFailure(reason) == FailureInput {
+				job.Error = formatInputJobFailure(task, reason, split.File)
+			} else if reason != "" {
+				job.Error = fmt.Sprintf("map-%d failed: %s", i, reason)
+			} else {
+				job.Error = fmt.Sprintf("map-%d failed", i)
+			}
 			job.CompletedAt = time.Now()
 			return job, errors.New(job.Error)
 		}
@@ -101,7 +107,7 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 	for r := 0; r < config.NReduce; r++ {
 		task := &Task{ID: r, Type: ReduceTask, State: InProgress, ReduceID: r}
 		job.ReduceTasks = append(job.ReduceTasks, task)
-		ok, metrics := localWorker.doReduce(RequestTaskReply{
+		ok, metrics, reason := localWorker.doReduce(RequestTaskReply{
 			TaskType:   ReduceTask,
 			TaskID:     r,
 			NReduce:    config.NReduce,
@@ -114,7 +120,11 @@ func RunLocal(config JobConfig, outputPrefix string) (*Job, error) {
 		})
 		if !ok {
 			job.State = JobFailed
-			job.Error = fmt.Sprintf("reduce-%d failed", r)
+			if reason != "" {
+				job.Error = fmt.Sprintf("reduce-%d failed: %s", r, reason)
+			} else {
+				job.Error = fmt.Sprintf("reduce-%d failed", r)
+			}
 			job.CompletedAt = time.Now()
 			return job, errors.New(job.Error)
 		}

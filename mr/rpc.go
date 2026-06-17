@@ -20,7 +20,8 @@ type RequestTaskReply struct {
 	CombineFunc string
 	WorkDir     string
 	JobID       string
-	AttemptID   int // worker must echo this back in ReportTask
+	JobState    string // running / failed / completed — worker uses this to stop work on a dead job
+	AttemptID   int    // worker must echo this back in ReportTask
 }
 
 // ReportTaskArgs reports task completion or failure.
@@ -32,6 +33,8 @@ type ReportTaskArgs struct {
 	AttemptID int // must match the current attempt; stale reports are ignored
 	Success   bool
 	Metrics   TaskMetrics
+	// FailureReason is set when Success=false; used to distinguish data faults from worker faults.
+	FailureReason string
 }
 
 // ReportTaskReply acknowledges a task report.

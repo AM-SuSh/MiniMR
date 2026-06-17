@@ -201,6 +201,52 @@ func TestStartJobRejectsWhileCurrentRunning(t *testing.T) {
 	}
 }
 
+func TestStartJobAllowedAfterJobFailed(t *testing.T) {
+	master := mr.NewMaster(":0", ":0")
+	workDir := t.TempDir()
+	job, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		SplitSize:   10,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     workDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var reply mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "w1"}, &reply)
+	var rr mr.ReportTaskReply
+	master.ReportTask(&mr.ReportTaskArgs{
+		WorkerID:      "w1",
+		JobID:         job.ID,
+		TaskType:      mr.MapTask,
+		TaskID:        reply.TaskID,
+		AttemptID:     reply.AttemptID,
+		Success:       false,
+		FailureReason: "input_read: open missing.txt: no such file",
+	}, &rr)
+
+	if master.GetJob(job.ID).State != mr.JobFailed {
+		t.Fatalf("expected JobFailed, got %s", master.GetJob(job.ID).State)
+	}
+
+	_, err = master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     t.TempDir(),
+	})
+	if err != nil {
+		t.Fatalf("expected new job after failure, got %v", err)
+	}
+}
+
 func TestJobHistoryKeepsCompletedJobs(t *testing.T) {
 	logDir := t.TempDir()
 	oldLogDir := mr.JobLogDir
@@ -579,6 +625,200 @@ func TestWorkerBlacklist(t *testing.T) {
 		t.Fatalf("expected ExitTask for blacklisted worker, got %v", reply.TaskType)
 	}
 	_ = job
+}
+
+func TestInputReadFailureFailsJobFast(t *testing.T) {
+	logDir := t.TempDir()
+	mr.JobLogDir = logDir
+
+	master := mr.NewMaster(":0", ":0")
+	workDir := t.TempDir()
+	job, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		SplitSize:   10,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     workDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var reply mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "data-worker"}, &reply)
+	if reply.TaskType != mr.MapTask {
+		t.Fatalf("expected MapTask, got %v", reply.TaskType)
+	}
+
+	var rr mr.ReportTaskReply
+	master.ReportTask(&mr.ReportTaskArgs{
+		WorkerID:      "data-worker",
+		JobID:         job.ID,
+		TaskType:      mr.MapTask,
+		TaskID:        reply.TaskID,
+		AttemptID:     reply.AttemptID,
+		Success:       false,
+		FailureReason: "input_read: open " + reply.InputFile + ": no such file or directory",
+	}, &rr)
+
+	job = master.GetJob(job.ID)
+	if job.State != mr.JobFailed {
+		t.Fatalf("expected JobFailed, got %s", job.State)
+	}
+	if !strings.Contains(job.Error, "输入数据不可用") {
+		t.Fatalf("expected input data error, got %q", job.Error)
+	}
+	if !strings.Contains(job.Error, reply.InputFile) {
+		t.Fatalf("expected input file in error, got %q", job.Error)
+	}
+
+	var waitReply mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "data-worker"}, &waitReply)
+	if waitReply.TaskType != mr.WaitTask {
+		t.Fatalf("expected WaitTask after job failure (worker stays alive), got %v", waitReply.TaskType)
+	}
+
+	bannerFound := false
+	for _, d := range job.Decisions {
+		if d.Type == mr.DecisionJobFailed && strings.Contains(d.Message, "════ 作业失败") {
+			bannerFound = true
+			break
+		}
+	}
+	if !bannerFound {
+		t.Fatal("expected job_failed banner in decisions")
+	}
+
+	logData, err := os.ReadFile(mr.JobLogPath(job.ID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(logData)
+	for _, want := range []string{`"kind":"finish"`, `"state":"failed"`, "输入数据不可用"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("job log missing %q:\n%s", want, text)
+		}
+	}
+}
+
+func TestJobFailureAbortsRemainingTasks(t *testing.T) {
+	master := mr.NewMaster(":0", ":0")
+	workDir := t.TempDir()
+	job, err := master.StartJob(mr.JobConfig{
+		InputFiles:  []string{filepath.Join("testdata", "input.txt")},
+		NReduce:     1,
+		SplitSize:   10,
+		MapFunc:     "wordcount_map",
+		ReduceFunc:  "wordcount_reduce",
+		CombineFunc: "wordcount_combine",
+		WorkDir:     workDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(job.MapTasks) < 2 {
+		t.Fatalf("need multiple map tasks, got %d", len(job.MapTasks))
+	}
+
+	var replyA mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "w-a"}, &replyA)
+	if replyA.TaskType != mr.MapTask {
+		t.Fatalf("expected MapTask for w-a, got %v", replyA.TaskType)
+	}
+
+	var replyB mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "w-b"}, &replyB)
+	if replyB.TaskType != mr.MapTask {
+		t.Fatalf("expected MapTask for w-b, got %v", replyB.TaskType)
+	}
+	if replyB.TaskID == replyA.TaskID {
+		t.Fatal("expected two different map tasks")
+	}
+
+	var rr mr.ReportTaskReply
+	master.ReportTask(&mr.ReportTaskArgs{
+		WorkerID:      "w-a",
+		JobID:         job.ID,
+		TaskType:      mr.MapTask,
+		TaskID:        replyA.TaskID,
+		AttemptID:     replyA.AttemptID,
+		Success:       false,
+		FailureReason: "input_read: open missing.txt: no such file",
+	}, &rr)
+
+	job = master.GetJob(job.ID)
+	if job.State != mr.JobFailed {
+		t.Fatalf("expected JobFailed, got %s", job.State)
+	}
+
+	abortedInProgress := job.MapTasks[replyB.TaskID]
+	if abortedInProgress.State != mr.Failed {
+		t.Fatalf("in-progress map should be aborted, got %s", abortedInProgress.State)
+	}
+	if abortedInProgress.AttemptID != replyB.AttemptID+1 {
+		t.Fatalf("expected attempt bump on abort, got %d want %d", abortedInProgress.AttemptID, replyB.AttemptID+1)
+	}
+
+	idleAborted := 0
+	for _, task := range job.MapTasks {
+		if task.State == mr.Failed && task.LastFailureReason == "job_aborted" {
+			idleAborted++
+		}
+	}
+	if idleAborted == 0 {
+		t.Fatal("expected idle map tasks to be marked job_aborted")
+	}
+
+	var waitReply mr.RequestTaskReply
+	master.RequestTask(&mr.RequestTaskArgs{WorkerID: "w-c"}, &waitReply)
+	if waitReply.TaskType != mr.WaitTask {
+		t.Fatalf("expected WaitTask after job failure, got %v", waitReply.TaskType)
+	}
+	if waitReply.JobState != mr.JobFailed.String() {
+		t.Fatalf("expected failed job state in reply, got %q", waitReply.JobState)
+	}
+
+	master.ReportTask(&mr.ReportTaskArgs{
+		WorkerID:  "w-b",
+		JobID:     job.ID,
+		TaskType:  mr.MapTask,
+		TaskID:    replyB.TaskID,
+		AttemptID: replyB.AttemptID,
+		Success:   true,
+	}, &rr)
+	if job.Metrics.StaleReports == 0 {
+		t.Fatal("expected stale report from aborted in-progress task")
+	}
+}
+
+func TestInputFailureDoesNotBlacklistWorker(t *testing.T) {
+	job := &mr.Job{
+		Config:           mr.JobConfig{NMap: 1, NReduce: 1},
+		State:            mr.JobRunning,
+		ReduceTasks:      []*mr.Task{{ID: 0, Type: mr.ReduceTask, State: mr.Idle}},
+		MapDoneForReduce: [][]bool{{false}},
+		MapTasks: []*mr.Task{{
+			ID:        0,
+			Type:      mr.MapTask,
+			State:     mr.InProgress,
+			WorkerID:  "w1",
+			StartTime: time.Now(),
+			AttemptID: 1,
+			MapInfo:   &mr.MapTaskInfo{Split: mr.Split{File: "testdata/input.txt"}},
+		}},
+	}
+	tm := mr.NewTaskManager(job)
+	tm.RegisterWorker("w1")
+	tm.CompleteTask(job.MapTasks[0], false, "w1", mr.TaskMetrics{}, "input_read: open testdata/input.txt: no such file")
+
+	if tm.IsWorkerBlacklisted("w1") {
+		t.Fatal("input failure should not blacklist worker")
+	}
+	if job.State != mr.JobFailed {
+		t.Fatalf("expected JobFailed, got %s", job.State)
+	}
 }
 
 // Ensure rpc types compile with net/rpc

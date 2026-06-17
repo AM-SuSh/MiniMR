@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 )
@@ -102,7 +103,7 @@ func (tm *TaskManager) AssignTask(task *Task, workerID string) {
 
 // CompleteTask marks a task as Completed or Failed, tracks worker reliability,
 // and records completion time for speculative execution decisions.
-func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, metrics TaskMetrics) {
+func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, metrics TaskMetrics, failureReason string) {
 	tm.mu.Lock()
 	defer tm.mu.Unlock()
 
@@ -110,7 +111,7 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, m
 		w.CurrentTask = -1
 		if success {
 			w.FailureCount = 0
-		} else {
+		} else if IsWorkerFault(ClassifyFailure(failureReason)) {
 			w.FailureCount++
 			if w.FailureCount >= DefaultMaxWorkerFailures && !w.Blacklisted {
 				w.Blacklisted = true
@@ -128,6 +129,7 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, m
 
 	if success {
 		task.State = Completed
+		task.LastFailureReason = ""
 		tm.job.Metrics.AddTask(metrics)
 		elapsed := time.Since(task.StartTime)
 		if task.Type == MapTask {
@@ -145,15 +147,29 @@ func (tm *TaskManager) CompleteTask(task *Task, success bool, workerID string, m
 		})
 	} else {
 		task.State = Failed
+		task.LastFailureReason = failureReason
 		tm.job.Metrics.TaskFailures++
+		failMsg := fmt.Sprintf("%s-%d 失败 (worker %s, attempt %d)", task.Type, task.ID, workerID, task.AttemptID)
+		if failureReason != "" {
+			failMsg = fmt.Sprintf("%s：%s", failMsg, failureReason)
+		}
 		tm.logDecision(DecisionEvent{
 			Type:      DecisionFail,
-			Message:   fmt.Sprintf("%s-%d 失败 (worker %s, attempt %d)", task.Type, task.ID, workerID, task.AttemptID),
+			Message:   failMsg,
 			WorkerID:  workerID,
 			TaskType:  task.Type.String(),
 			TaskID:    task.ID,
 			AttemptID: task.AttemptID,
 		})
+
+		switch ClassifyFailure(failureReason) {
+		case FailureInput:
+			tm.failJobLocked(formatInputJobFailure(task, failureReason, ""))
+			return
+		case FailureConfig:
+			tm.failJobLocked(fmt.Sprintf("作业配置错误：%s", strings.TrimSpace(strings.TrimPrefix(failureReason, "config:"))))
+			return
+		}
 	}
 	tm.job.snapshotWorkersLocked(tm.workers, time.Now(), tm.workerTimeout)
 }
@@ -268,8 +284,8 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 				AttemptID: task.AttemptID,
 			})
 			if task.RetryCount > DefaultMaxRetries {
-				tm.failJobLocked(fmt.Sprintf(
-					"task %s-%d exceeded max retries (%d)", task.Type, task.ID, DefaultMaxRetries))
+				tm.failJobLocked(formatJobFailureReason(task, fmt.Sprintf(
+					"task %s-%d exceeded max retries (%d)", task.Type, task.ID, DefaultMaxRetries)))
 				return
 			}
 			tm.clearWorkerTaskLocked(task.WorkerID, task)
@@ -304,13 +320,22 @@ func (tm *TaskManager) checkSingleTaskLocked(task *Task, now time.Time, median t
 		}
 
 	case Failed:
+		if cat := ClassifyFailure(task.LastFailureReason); cat == FailureInput || cat == FailureConfig {
+			switch cat {
+			case FailureInput:
+				tm.failJobLocked(formatInputJobFailure(task, task.LastFailureReason, ""))
+			case FailureConfig:
+				tm.failJobLocked(fmt.Sprintf("作业配置错误：%s", strings.TrimSpace(strings.TrimPrefix(task.LastFailureReason, "config:"))))
+			}
+			return
+		}
 		task.RetryCount++
 		tm.job.Metrics.Retries++
 		log.Printf("task %s-%d failed (retry %d/%d)",
 			task.Type, task.ID, task.RetryCount, DefaultMaxRetries)
 		if task.RetryCount > DefaultMaxRetries {
-			tm.failJobLocked(fmt.Sprintf(
-				"task %s-%d exceeded max retries (%d)", task.Type, task.ID, DefaultMaxRetries))
+			tm.failJobLocked(formatJobFailureReason(task, fmt.Sprintf(
+				"task %s-%d exceeded max retries (%d)", task.Type, task.ID, DefaultMaxRetries)))
 			return
 		}
 		task.State = Idle
@@ -327,12 +352,55 @@ func (tm *TaskManager) failJobLocked(reason string) {
 	tm.job.Error = reason
 	tm.job.CompletedAt = time.Now()
 	log.Printf("JOB FAILED: %s", reason)
-	tm.logDecision(DecisionEvent{
-		Type:    DecisionJobFailed,
-		Message: reason,
-	})
+	tm.abortJobTasksLocked()
+	if !hasTerminalDecision(tm.decisions, DecisionJobFailed) {
+		tm.logDecision(jobFailedBannerEvent(tm.job, tm.job.CompletedAt, reason))
+	}
 	tm.job.snapshotWorkersLocked(tm.workers, tm.job.CompletedAt, tm.workerTimeout)
 	tm.job.closeJobLog()
+}
+
+// abortJobTasksLocked cancels every unfinished task so workers stop doing useless work.
+func (tm *TaskManager) abortJobTasksLocked() {
+	var inProgress, pending int
+	for _, task := range tm.job.MapTasks {
+		tm.abortTaskIfNeededLocked(task, &inProgress, &pending)
+	}
+	for _, task := range tm.job.ReduceTasks {
+		tm.abortTaskIfNeededLocked(task, &inProgress, &pending)
+	}
+	for _, w := range tm.workers {
+		w.CurrentTask = -1
+		w.CurrentType = WaitTask
+	}
+	if inProgress > 0 || pending > 0 {
+		tm.logDecision(DecisionEvent{
+			Type: DecisionJobAborted,
+			Message: fmt.Sprintf(
+				"作业已中止，取消 %d 个进行中 / %d 个待调度任务",
+				inProgress, pending,
+			),
+		})
+	}
+}
+
+func (tm *TaskManager) abortTaskIfNeededLocked(task *Task, inProgress, pending *int) {
+	switch task.State {
+	case InProgress:
+		*inProgress++
+		if task.WorkerID != "" {
+			tm.clearWorkerTaskLocked(task.WorkerID, task)
+		}
+		task.AttemptID++
+		task.State = Failed
+		task.WorkerID = ""
+		task.StartTime = time.Time{}
+		task.LastFailureReason = "job_aborted"
+	case Idle:
+		*pending++
+		task.State = Failed
+		task.LastFailureReason = "job_aborted"
+	}
 }
 
 func (tm *TaskManager) maybeLogReduceSlowStartLocked() {

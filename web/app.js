@@ -412,7 +412,7 @@
       .join("\n");
   }
 
-  function decisionsForDisplay(decisions, job) {
+  function decisionsForDisplay(decisions, job, prog) {
     const list = [...(decisions || [])];
     if (job.state === "completed" && !list.some((d) => d.type === "job_completed")) {
       list.push({
@@ -420,21 +420,24 @@
         time: job.completed_at || null,
         message: `════ 作业完成 ════ Job ${job.id}`,
       });
-    } else if (job.state === "failed" && !list.some((d) => d.type === "job_failed") && job.error) {
+    } else if (job.state === "failed" && !list.some((d) => d.type === "job_failed")) {
+      const mapLine = `${prog?.map_completed ?? "?"}/${prog?.map_total ?? "?"}`;
+      const reduceLine = `${prog?.reduce_completed ?? "?"}/${prog?.reduce_total ?? "?"}`;
+      const detail = job.error || "未知原因";
       list.push({
         type: "job_failed",
         time: job.completed_at || null,
-        message: job.error,
+        message: `════ 作业失败 ════ Map ${mapLine} · Reduce ${reduceLine} · ${detail}`,
       });
     }
     return list;
   }
 
-  function renderDecisionsLog(decisions, job) {
+  function renderDecisionsLog(decisions, job, prog) {
     const logEl = els.decisionsLog;
     if (!logEl) return;
 
-    const list = decisionsForDisplay(decisions, job);
+    const list = decisionsForDisplay(decisions, job, prog);
     const fp = decisionFingerprint(list);
     const jobSwitched = job.id !== decisionsJobId;
 
@@ -675,7 +678,7 @@
     els.partitionGrid.innerHTML = (data.reduce_partitions || []).map(renderPartition).join("");
 
     const decisions = data.decisions || [];
-    renderDecisionsLog(decisions, job);
+    renderDecisionsLog(decisions, job, prog);
 
     els.lastUpdate.textContent = `更新 ${formatDateTime(data.server_time)}`;
     if (!paused) {

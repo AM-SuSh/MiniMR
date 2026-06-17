@@ -199,7 +199,7 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 	defer m.mu.Unlock()
 
 	if m.current == nil {
-		reply.TaskType = WaitTask
+		m.replyWaitTask(nil, reply)
 		return nil
 	}
 
@@ -215,7 +215,7 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 	}
 
 	if job.State == JobFailed || job.State == JobCompleted {
-		reply.TaskType = WaitTask
+		m.replyWaitTask(job, reply)
 		return nil
 	}
 
@@ -251,16 +251,29 @@ func (m *Master) RequestTask(args *RequestTaskArgs, reply *RequestTaskReply) err
 	}
 
 	if m.allTasksCompleteLocked(job) {
-		reply.TaskType = WaitTask
+		m.replyWaitTask(job, reply)
 		m.completeJobLocked(job, time.Now())
 		return nil
 	}
 
-	reply.TaskType = WaitTask
+	m.replyWaitTask(job, reply)
 	return nil
 }
 
+func (m *Master) replyWaitTask(job *Job, reply *RequestTaskReply) {
+	reply.TaskType = WaitTask
+	if job == nil {
+		return
+	}
+	reply.JobID = job.ID
+	reply.JobState = job.State.String()
+}
+
 func (m *Master) assignTaskLocked(job *Job, task *Task, workerID string, reply *RequestTaskReply) {
+	if job.State != JobRunning {
+		m.replyWaitTask(job, reply)
+		return
+	}
 	m.tm.AssignTask(task, workerID)
 	reply.TaskType = task.Type
 	reply.TaskID = task.ID
@@ -271,6 +284,7 @@ func (m *Master) assignTaskLocked(job *Job, task *Task, workerID string, reply *
 	reply.CombineFunc = job.Config.CombineFunc
 	reply.WorkDir = job.Config.WorkDir
 	reply.JobID = job.ID
+	reply.JobState = job.State.String()
 	reply.ReduceID = task.ReduceID
 	reply.AttemptID = task.AttemptID
 
@@ -306,6 +320,11 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 	}
 
 	job := m.current
+	if job.State == JobFailed {
+		job.Metrics.StaleReports++
+		return nil
+	}
+
 	var task *Task
 	if args.TaskType == MapTask {
 		if args.TaskID >= 0 && args.TaskID < len(job.MapTasks) {
@@ -339,14 +358,17 @@ func (m *Master) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error 
 	}
 
 	if args.Success {
-		m.tm.CompleteTask(task, true, args.WorkerID, args.Metrics)
+		m.tm.CompleteTask(task, true, args.WorkerID, args.Metrics, "")
 		if args.TaskType == MapTask {
 			for r := 0; r < job.Config.NReduce; r++ {
 				m.tm.MarkMapDoneForReduce(args.TaskID, r)
 			}
 		}
 	} else {
-		m.tm.CompleteTask(task, false, args.WorkerID, args.Metrics)
+		m.tm.CompleteTask(task, false, args.WorkerID, args.Metrics, args.FailureReason)
+	}
+	if job.State == JobFailed {
+		return nil
 	}
 	if m.allTasksCompleteLocked(job) {
 		m.completeJobLocked(job, time.Now())
@@ -513,24 +535,34 @@ func (m *Master) handleStatus(w http.ResponseWriter, r *http.Request) {
 	mapDone, mapTotal := countCompleted(job.MapTasks)
 	reduceDone, reduceTotal := countCompleted(job.ReduceTasks)
 	state := job.State.String()
-	if m.allTasksCompleteLocked(job) {
-		m.completeJobLocked(job, time.Now())
-		state = JobCompleted.String()
-	} else if mapDone < mapTotal || reduceDone < reduceTotal {
-		job.State = JobRunning
-		state = JobRunning.String()
+	switch job.State {
+	case JobFailed, JobCompleted:
+		// Terminal states must not be overwritten by progress heuristics.
+	default:
+		if m.allTasksCompleteLocked(job) {
+			m.completeJobLocked(job, time.Now())
+			state = JobCompleted.String()
+		} else if mapDone < mapTotal || reduceDone < reduceTotal {
+			job.State = JobRunning
+			state = JobRunning.String()
+		}
 	}
+	errMsg := job.Error
 	m.mu.Unlock()
 
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+	payload := map[string]interface{}{
 		"job_id":           job.ID,
 		"state":            state,
 		"map_completed":    mapDone,
 		"map_total":        mapTotal,
 		"reduce_completed": reduceDone,
 		"reduce_total":     reduceTotal,
-	})
+	}
+	if errMsg != "" {
+		payload["error"] = errMsg
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(payload)
 }
 
 func countCompleted(tasks []*Task) (done, total int) {

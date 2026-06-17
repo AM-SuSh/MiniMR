@@ -8,6 +8,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
 	"time"
 )
 
@@ -57,6 +58,14 @@ func main() {
 
 		if state, _ := status["state"].(string); state == "completed" {
 			break
+		}
+		if state, _ := status["state"].(string); state == "failed" {
+			if errMsg, _ := status["error"].(string); errMsg != "" {
+				fmt.Fprintf(os.Stderr, "Job failed: %s\n", errMsg)
+			} else {
+				fmt.Fprintln(os.Stderr, "Job failed")
+			}
+			os.Exit(1)
 		}
 		time.Sleep(2 * time.Second)
 	}

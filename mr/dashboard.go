@@ -228,9 +228,19 @@ func (m *Master) snapshotWithTM(job *Job, tm *TaskManager, now time.Time) Dashbo
 	snap.Workers = workersToDashboard(tm.workers, job, now, tm.workerTimeout)
 	snap.ReducePartitions = partitionStatus(job)
 	snap.Optimizations = optimizationSnapshot(job, snap.Progress, snap.Workers)
-	snap.Decisions = copyDecisions(tm.decisions)
+	snap.Decisions = decisionsForDashboard(job, tm.decisions)
 
 	return snap
+}
+
+func decisionsForDashboard(job *Job, live []DecisionEvent) []DecisionEvent {
+	// Terminal jobs freeze decisions on the job record; live jobs stream from TaskManager.
+	if job.State == JobFailed || job.State == JobCompleted {
+		if len(job.Decisions) > 0 {
+			return copyDecisions(job.Decisions)
+		}
+	}
+	return copyDecisions(live)
 }
 
 func (m *Master) jobHistoryLocked(selected *Job, now time.Time) []DashboardJobSummary {
