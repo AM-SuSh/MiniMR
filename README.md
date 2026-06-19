@@ -143,11 +143,6 @@ Windows PowerShell 下可将 `bin/master` 换为 `bin\master.exe` 等。
 go run . -input testdata/input.txt -output mr-out-standalone -nreduce 3
 ```
 
-python集成：
-
-```
-python bridge/submit_job.py --input testdata/input.txt
-```
 
 ### 4.4 分布式部署
 
